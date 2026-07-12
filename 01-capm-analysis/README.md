@@ -14,9 +14,10 @@ Výstup je RMarkdown, ktorý sa generuje do interaktívneho HTML dokumentu (`cod
 
 ## Autorstvo
 
-Tímová úloha, zverejnená so súhlasom všetkých autorov: **P.-J. N., V. K., A. B.** a **Dana Kozáková** (Skupina 02, Tím 07).
+Tímová úloha, autori: **P.-J. N., V. K., A. B.** a **Dana Kozáková** (Skupina 02, Tím 07).
 
-Môj podiel: **Príklad 1** — získanie a príprava dát, výpočet výnosov, odhad beta koeficientov a charakteristických kriviek, test nulovosti konštanty α. Ďalej revízia a zjednotenie kódu a komentárov naprieč dokumentom.
+Môj podiel: **Príklad 1** — získanie a príprava dát, výpočet výnosov, odhad beta koeficientov a charakteristických kriviek, test nulovosti konštanty α. 
+Revízia a zjednotenie kódu a komentárov naprieč dokumentom.
 
 ## Dáta
 

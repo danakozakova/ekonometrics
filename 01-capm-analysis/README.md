@@ -1,4 +1,4 @@
-# Úloha 1 — Analýza modelu CAPM 📈
+# Úloha 1 — Analýza modelu CAPM
 
 > 🇬🇧 *Team assignment from an Econometrics course (Masaryk University): estimating and testing the Capital Asset Pricing Model (CAPM) on S&P 500 stocks. Characteristic lines and beta estimation, tests of Jensen's alpha, the security market line, the Fama-MacBeth specification, Chow tests for structural breaks, and a dual-beta asymmetry model. Built in R (tidyverse). Write-up in Slovak.*
 

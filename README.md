@@ -1,4 +1,4 @@
-# Ekonometria — projekty v R a gretli 📊
+# Ekonometria — projekty v R a gretli
 
 > 🇬🇧 *Econometrics projects from graduate coursework (Masaryk University). One solo project — a LOGIT analysis of emergency-care determinants in type-1 diabetes — plus three team assignments (CAPM, Okun's law, the New Keynesian Phillips Curve). Built in R and gretl. Write-ups are in Slovak.*
 

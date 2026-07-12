@@ -1,4 +1,4 @@
-# Úloha 3 — Novokeynesovská Phillipsova krivka (NKPC) 🇫🇷
+# Úloha 3 — Novokeynesovská Phillipsova krivka (NKPC)
 
 > 🇬🇧 *Team assignment from an Econometrics course (Masaryk University): estimating the New Keynesian Phillips Curve for France, replicating the approach of Galí & Gertler (1999). GMM estimation (forward-looking and hybrid, reduced and structural forms) with J-tests, restricted models for long-run verticality, plus NLS and ML estimates (normal and t-distributed errors) and likelihood-ratio tests. Built in R. Write-up in Slovak.*
 

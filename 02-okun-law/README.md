@@ -1,4 +1,4 @@
-# Úloha 2 — Okunov zákon a štrukturálne zlomy 📉
+# Úloha 2 — Okunov zákon a štrukturálne zlomy
 
 > 🇬🇧 *Team assignment from an Econometrics course (Masaryk University): estimating Okun's law with structural-break testing. Static and dynamic specifications, Chow breakpoint and forecast tests, an interaction-dummy break model, and an asymmetry test. Built in R. Write-up in Slovak.*
 

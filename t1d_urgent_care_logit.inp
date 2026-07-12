@@ -1,0 +1,74 @@
+# =============================================================
+# Determinanty urgentných návštev zdravotníckych zariadení
+# u pacientov s diabetom 1. typu (ťažká hypoglykémia / DKA)
+# LOGIT model, dáta T1D Exchange (USA, 2016)
+#
+# Autorka: Dana Kozáková
+# Predmet: Základy ekonometrie, Masarykova univerzita
+#
+# POZNÁMKA K DÁTAM: dataset nie je súčasťou repozitára
+# (podlieha podmienkam T1D Exchange). Postup na získanie
+# prístupu je v README. Skript predpokladá súbor
+# v ceste  data/t1d_data.gdt  (2 454 pozorovaní).
+# =============================================================
+
+open "data/t1d_data.gdt"
+
+# -------------------------------------------------------------
+# 1. Príprava premenných
+# -------------------------------------------------------------
+# Rasa a spôsob podávania inzulínu ako kategoriálne -> dummy
+setinfo Race --discrete
+setinfo Race --coded
+dummify Race --drop-last
+dummify GENDER --drop-first
+dummify InsulinDelivery
+dummify EmployStatus --drop-first
+
+# Popisy kľúčových premenných (pre čitateľnosť výstupov)
+setinfo VISIT --description="návšteva zariadenia kvôli hypoglykémii alebo DKA - posledné 3 mesiace"
+setinfo DRace_3 --description="Black / African American"
+setinfo DInsulinDelivery_1 --description="inzulínová pumpa"
+setinfo InsuranceCosts --description="náklady na poistenie / starostlivosť"
+setinfo DesignatedHelpSchool --description="určená pomoc v škole"
+setinfo HelpAlwaysAvail --description="pomoc vždy dostupná"
+setinfo HypoEvents --description="počet hypoglykemických epizód"
+setinfo EduLevel --description="úroveň vzdelania"
+
+# Binárny príznak: návšteva aj z iného dôvodu (áno/nie)
+VISIT_OtherReasonTF = VISIT_OtherReason > 0
+
+# -------------------------------------------------------------
+# 2. Finálny LOGIT model
+# -------------------------------------------------------------
+# Vysvetľovaná premenná: VISIT (0/1)
+# Špecifikácia je výsledkom postupného výberu prediktorov
+# (demografia, spôsob liečby, náklady, dostupnosť pomoci,
+#  zdravotné komplikácie, vzdelanie, zamestnanie).
+logit VISIT 0 DRace_3 DGENDER_1 DInsulinDelivery_1 InsuranceCosts \
+  DesignatedHelpSchool HelpAlwaysAvail NumberOfFalls VISIT_OtherReasonTF \
+  HypoEvents EduLevel DEmployStatus_6 --p-values
+
+# -------------------------------------------------------------
+# 3. Diagnostika
+# -------------------------------------------------------------
+# Multikolinearita (VIF < 10 = v poriadku)
+vif
+
+# Belsley-Kuh-Welsch diagnostika kolinearity
+bkw
+
+# -------------------------------------------------------------
+# 4. Porovnanie: PROBIT s rovnakou špecifikáciou
+# -------------------------------------------------------------
+probit VISIT 0 DRace_3 DGENDER_1 DInsulinDelivery_1 InsuranceCosts \
+  DesignatedHelpSchool HelpAlwaysAvail NumberOfFalls VISIT_OtherReasonTF \
+  HypoEvents EduLevel DEmployStatus_6 --p-values
+
+# =============================================================
+# Poznámka: v priebehu analýzy bolo otestovaných viac ako 70
+# alternatívnych špecifikácií (rôzne kombinácie prediktorov,
+# vrátane BMI, awareness škál, vzdialenosti od kliniky a i.).
+# Nevýznamné prediktory boli postupne vyradené; vyššie uvedený
+# model je výsledná úsporná špecifikácia.
+# =============================================================

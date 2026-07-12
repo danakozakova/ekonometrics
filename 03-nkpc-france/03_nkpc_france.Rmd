@@ -1,0 +1,1598 @@
+---
+title: "Novokeynesiánska Phillipsova krivka pre ekonomiku Francúzska"
+author:
+- "Bc. Pavel-Jakub Novotný"
+- "Bc. Viktória Kudlejová"
+- "Bc. Adriana Bednáriková"
+- "Mgr. Dana Kozáková"
+- "(Skupina 02, Tím 07)"
+date: "`r format(Sys.Date(), '%d. %m. %Y')`"
+output:
+  html_document:
+    number_sections: false
+    toc: false
+    toc_float: true
+    theme: flatly
+    highlight: tango
+    code_folding: show
+    code_download: true
+    df_print: paged
+  pdf_document:
+    toc: true
+lang: sk
+subtitle: "Odhad NKPC metódami GMM, NLS a ML"
+---
+
+```{=html}
+<style>
+.komentar {
+  background-color: #fdf3ee;
+  border-left: 4px solid #A0522D;
+  padding: 15px;
+  margin: 15px 0;
+  border-radius: 5px;
+}
+h2 { color: #A0522D; border-bottom: 2px solid #eee; padding-bottom: 5px; }
+table { border-collapse: collapse; margin: 15px 0; }
+th, td { padding: 6px 16px; }
+</style>
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo       = FALSE,
+  fig.height = 6,
+  fig.width  = 10,
+  message    = FALSE,
+  warning    = FALSE,
+  fig.align  = "center"
+)
+library(tidyverse)
+library(ggplot2)
+library(forecast)
+library(mFilter)
+library(gmm)
+library(openxlsx)
+library(ggfortify)
+library(maxLik)
+library(MASS)
+library(broom)
+library(patchwork)
+library(dplyr)
+library(readr)
+library(modelsummary)
+
+```
+
+
+
+# Príklad 1: Voľba ekonomiky a príprava dát
+
+Analyzujeme ekonomiku **Francúzska (FRA)** v štvrťročnej frekvencii za obdobie **2003Q2 – 2025Q1**.
+
+Použité datasety pochádzajú z databáz OECD a FRED (Federal Reserve Economic Data):
+
+- **Index spotrebiteľských cien (CPI)** – FRED: `FRACPIALLQINMEI`, štvrťročne od 1955
+- **Reálne HDP** – FRED: `CLVMNACSCAB1GQFR`, štvrťročne od 1980
+- **Jednotkové náklady práce (ULC)** – ECB/OECD, štvrťročne od 1978 (aproximácia *labor income share*)
+- **Dlhodobá úroková miera** – FRED: `IRLTLT01FRQ156N`, štvrťročne od 1980
+- **Krátkodobá úroková miera** – ECB: Cost of borrowing, mesačne od 2003 (agregácia na Q)
+- **Mzdy** – ECB/OECD: nominálne mzdy, štvrťročne od 1949
+- **Deflátor** - FRED: `NGDPDSAIXFRQ` štvrťročne od roku 1980
+
+## Príklad 1.1: Načítanie a zlúčenie dát
+
+```{r load-data}
+# Pomocná funkcia: z data.frame vytvorí ts objekt (štvrťročný)
+make_qts <- function(df, value_col, year_col = "year", quarter_col = "quarter") {
+  ts(df[[value_col]], start = c(df[[year_col]][1], df[[quarter_col]][1]), frequency = 4)
+}
+
+# --- CPI (FRED, štvrťročne, 1955–2025) ---
+cpi_raw <- read.csv("data/France CPI.csv") %>%
+  rename(date = 1, cpi = 2) %>%
+  mutate(date    = as.Date(date),
+         year    = as.integer(format(date, "%Y")),
+         quarter = (as.integer(format(date, "%m")) - 1) %/% 3 + 1L)
+cpi_ts <- make_qts(cpi_raw, "cpi")
+
+# --- Reálne HDP (FRED, štvrťročne, 1980–2026) ---
+gdp_raw <- read.csv("data/France real GDP.csv") %>%
+  rename(date = 1, gdp = 2) %>%
+  mutate(date    = as.Date(date),
+         year    = as.integer(format(date, "%Y")),
+         quarter = (as.integer(format(date, "%m")) - 1) %/% 3 + 1L)
+gdp_ts <- make_qts(gdp_raw, "gdp")
+
+# --- ULC (ECB/OECD, štvrťročne, 1978–2025) ---
+ulc_raw <- read.csv("data/France Unit labour cost.csv") %>%
+  rename(date_str = 1, period = 2, ulc = 3) %>%
+  mutate(year    = as.integer(substr(period, 1, 4)),
+         quarter = as.integer(substr(period, 6, 6)))
+ulc_ts <- make_qts(ulc_raw, "ulc")
+
+# --- Dlhodobá úroková miera (FRED, štvrťročne, 1980–2025) ---
+lt_raw <- read.csv("data/Long_term interest rate France.csv") %>%
+  rename(date = 1, long_rate = 2) %>%
+  mutate(date    = as.Date(date),
+         year    = as.integer(format(date, "%Y")),
+         quarter = (as.integer(format(date, "%m")) - 1) %/% 3 + 1L)
+lt_ts <- make_qts(lt_raw, "long_rate")
+
+# --- Krátkodobá úroková miera (ECB, mesačne, 2003–2026) → agregácia na Q ---
+st_q <- read.csv("data/short-term loans france.csv") %>%
+  rename(date_str = 1, period = 2, short_rate = 3) %>%
+  mutate(date    = as.Date(date_str),
+         year    = as.integer(format(date, "%Y")),
+         quarter = (as.integer(format(date, "%m")) - 1) %/% 3 + 1L) %>%
+  group_by(year, quarter) %>%
+  summarise(short_rate = mean(short_rate), .groups = "drop") %>%
+  arrange(year, quarter)
+st_ts <- make_qts(st_q, "short_rate")
+
+# --- Mzdy a platy (ECB/OECD, štvrťročne, 1949–2025) ---
+wages_raw <- read.csv("data/Wages and saleries france.csv") %>%
+  rename(date_str = 1, period = 2, wages = 3) %>%
+  mutate(year    = as.integer(substr(period, 1, 4)),
+         quarter = as.integer(substr(period, 6, 6)))
+wages_ts <- make_qts(wages_raw, "wages")
+
+# --- Deflátor HDP (FRED, štvrťročne, 1980-2026) ---
+deflator_raw <- read.csv("data/france_deflator.csv") %>%
+  rename(date = 1, deflator = 2) %>%
+  mutate(date = as.Date(date),
+         year = as.integer(format(date, "%Y")),
+         quarter = (as.integer(format(date, "%m")) - 1) %/% 3 + 1L)
+deflator_ts <- make_qts(deflator_raw, "deflator")
+
+```
+
+
+```{r raw-plots, fig.height=8, fig.width=10}
+
+p1 <- autoplot(cpi_ts, linewidth = 0.8, colour = "#2c7bb6") +
+  ggtitle("CPI (index)") +
+  xlab(NULL) + ylab(NULL) +
+  theme_minimal(base_size = 11)
+
+p2 <- autoplot(gdp_ts, linewidth = 0.8, colour = "#2c7bb6") +
+  ggtitle("Reálne HDP") +
+  xlab(NULL) + ylab(NULL) +
+  theme_minimal(base_size = 11)
+  
+p3 <- autoplot(ulc_ts, linewidth = 0.8, colour = "#2c7bb6") +
+  ggtitle("ULC (jednotkové náklady práce)") +
+  xlab(NULL) + ylab(NULL) +
+  theme_minimal(base_size = 11)
+
+p4 <- autoplot(lt_ts, linewidth = 0.8, colour = "#2c7bb6") +
+  ggtitle("Dlhodobá úroková miera (%)") +
+  xlab(NULL) + ylab(NULL) +
+  theme_minimal(base_size = 11)
+
+p5 <- autoplot(st_ts, linewidth = 0.8, colour = "#2c7bb6") +
+  ggtitle("Krátkodobá úroková miera (%)") +
+  xlab(NULL) + ylab(NULL) +
+  theme_minimal(base_size = 11)
+
+p6 <- autoplot(wages_ts, linewidth = 0.8, colour = "#2c7bb6") +
+  ggtitle("Mzdy a platy (nominálne)") +
+  xlab(NULL) + ylab(NULL) +
+  theme_minimal(base_size = 11)
+  
+p7 <- autoplot(deflator_ts, linewidth = 0.8, colour = "#2c7bb6") +
+  ggtitle("Deflátor HDP") +
+  xlab(NULL) + ylab(NULL) +
+  theme_minimal(base_size = 11)
+  
+(p1 + p2) / (p3 + p4) / (p5 + p6) / p7
+
+```
+
+```{r merge-data}
+# Zlúčenie všetkých radov do jedného ts objektu
+ts_all <- ts.union(cpi_ts, gdp_ts, ulc_ts, lt_ts, st_ts, wages_ts, deflator_ts)
+colnames(ts_all) <- c("cpi", "gdp", "ulc", "long_rate", "short_rate", "wages", "deflator")
+
+# Pomocná funkcia pre formát štvrťroku
+fmt_q <- function(x, pos = "start") {
+  v <- if (pos == "start") start(x) else end(x)
+  sprintf("%d/Q%d", v[1], v[2])
+}
+
+knitr::kable(
+  data.frame(
+    Rad    = c("CPI (index spotrebiteľských cien)",
+               "Reálne HDP",
+               "ULC (jednotkové náklady práce)",
+               "Dlhodobá úroková miera",
+               "Krátkodobá úroková miera",
+               "Mzdy a platy (nominálne)",
+               "Deflator"),
+    Od     = sapply(list(cpi_ts, gdp_ts, ulc_ts, lt_ts, st_ts, wages_ts, deflator_ts), fmt_q, pos = "start"),
+    Do     = sapply(list(cpi_ts, gdp_ts, ulc_ts, lt_ts, st_ts, wages_ts, deflator_ts), fmt_q, pos = "end"),
+    N      = sapply(list(cpi_ts, gdp_ts, ulc_ts, lt_ts, st_ts, wages_ts, deflator_ts), length)
+  ),
+  col.names = c("Premenná", "Začiatok", "Koniec", "Pozorovaní"),
+  align     = c("l", "c", "c", "r"),
+  caption   = "Prehľad dostupnosti surových dát"
+)
+```
+
+::: komentar
+Dáta pre Francúzsko pochádzajú z databáz FRED a ECB/OECD. Väčšina radov pokrýva obdobie od 1980 alebo skôr, avšak **krátkodobá úroková miera** (Cost of borrowing, ECB) je dostupná až od roku 2003 v mesačnej frekvencii – agregovali sme ju na štvrťročné priemery. Keďže úrokové rozpätie (spread) vstupuje do sady inštrumentov pri GMM odhade, analýza je obmedzená na obdobie **2003Q2 – 2025Q1** (~88 pozorovaní). HP filter aplikujeme na celý dostupný rozsah jednotlivých radov, čím minimalizujeme skreslenie na okrajoch filtrácie.
+:::
+
+# Príklad 2: Odhad novokeynesiánskej Phillipsovej krivky (NKPC)
+## Príklad 2.1: Transformácia premenných a HP filter
+
+Na základe surových radov skonštruujeme stacionárne modelové premenné – percentuálne odchýlky od ustálených stavov pomocou HP filtra ($\lambda = 1600$ pre štvrťročné dáta).
+
+```{r transformations}
+# q-o-q inflácia podľa CPI (log diferencia)
+pi_cpi <- diff(log(cpi_ts))
+
+pi_def <- diff(log(deflator_ts))
+
+# output gap cez HP filter na log(reálne HDP)
+pom <- log(gdp_ts)
+pom_hp <- hpfilter(pom, freq = 1600, type = "lambda", drift = FALSE)
+gap <- pom_hp$cycle
+
+# ULC gap cez HP filter na log(ULC)
+pom <- log(ulc_ts)
+pom_hp <- hpfilter(pom, freq = 1600, type = "lambda", drift = FALSE)
+ulc <- pom_hp$cycle
+
+# úrokové rozpätie (dlhodobá − krátkodobá) / 100
+spread <- (lt_ts - st_ts) / 100
+
+# mzdová inflácia (log diferencia nominálnych miezd)
+pi_w <- diff(log(wages_ts))
+```
+
+```{r ts-model-vars}
+ts_y <- ts.union(pi_cpi, gap, ulc, spread, pi_w, pi_def)
+
+# orezanie na zvolené obdobie
+ts_y <- window(ts_y, start = c(2003, 2), end = c(2025, 1))
+```
+
+Obdobie analýzy: **`r paste0(start(ts_y), collapse = "Q")`** – **`r paste0(end(ts_y), collapse = "Q")`** (`r nrow(ts_y)` pozorovaní).
+
+
+```{r plot-vars}
+autoplot(ts_y, colour = TRUE, facets = TRUE, linewidth = 1) +
+  ggtitle("Modelové premenné – Francúzsko") +
+  xlab("Čas") +
+  theme_minimal(base_size = 12)
+```
+
+```{r ccf-gap, fig.height=4, fig.width=8}
+ggCcf(
+  ts_y[, "gap"],
+  ts_y[, "pi_cpi"],
+  lag.max = 20,
+  type = "correlation",
+  color = "salmon"
+) +
+  ggtitle("Krížová korelácia: output gap vs. inflácia (CPI)") +
+  theme_minimal(base_size = 12)
+```
+
+```{r ccf-ulc, fig.height=4, fig.width=8}
+ggCcf(
+  ts_y[, "ulc"],
+  ts_y[, "pi_cpi"],
+  lag.max = 20,
+  type = "correlation",
+  color = "salmon4"
+) +
+  ggtitle("Krížová korelácia: ULC gap vs. inflácia (CPI)") +
+  theme_minimal(base_size = 12)
+```
+
+::: komentar
+Krížové korelogramy zobrazujú vzťah medzi inflačnou dynamikou a dvoma alternatívnymi proxy premennými reálnych mezných nákladov – output gapom a odchýlkou ULC od trendu.
+
+V prípade output gapu korelácie s infláciou vykazujú nepravidelný a nestabilný vzor – väčšina hodnôt leží vo vnútri konfidenčného pásma, avšak pri záporných lagoch okolo −7 až −10 sa objavujú výrazné záporné korelácie (až −0.50), čo je ekonomicky ťažko interpretovateľné a nie je v súlade s predpokladmi NKPC. Neexistuje systematická pozitívna korelácia, ktorá by indikovala dopredu pozerajúce správanie firiem. Output gap teda nie je spoľahlivým prediktorom inflácie vo francúzskej ekonomike za sledované obdobie.
+
+V prípade ULC gapu je vzor korelácií výrazne odlišný. Pri kladných lagoch (ULC predchádza inflácii) sa objavujú pozitívne a štatisticky významné korelácie, čo je konzistentné s teóriou NKPC: rast jednotkových nákladov práce sa s určitým oneskorením premietne do cenovej dynamiky. Zároveň pri zápornom lagu −1 je viditeľná výrazná negatívna korelácia, čo môže odrážať cyklické pohyby spoločné pre oba rady. Celkový vzor podporuje použitie ULC ako primárnej proxy premennej reálnych mezných nákladov v následných GMM odhadoch.
+:::
+
+
+## Príklad 2.2: GMM odhady NKPC
+
+### Základná dopredu pozerajúca NKPC (redukovaná forma)
+
+```{r gmm-instruments}
+
+
+# vysvetlovana promenna
+yy <- ts_y[, "pi_def"]
+
+
+# vysvetlujici promenne, pi_def je posunuto o jedno obdobi dopredu
+XX <- ts.union(ts_y[, "ulc"], stats::lag(ts_y[, "pi_def"], k = 1))
+
+# instrumenty - zpozdene promenne o jedno az ctyri obdobi
+Z_1 <- stats::lag(ts_y[, c("pi_def", "gap", "ulc", "spread", "pi_w")], k = -1)
+Z_2 <- stats::lag(ts_y[, c("pi_def", "gap", "ulc", "spread", "pi_w")], k = -2)
+Z_3 <- stats::lag(ts_y[, c("pi_def", "gap", "ulc", "spread", "pi_w")], k = -3)
+Z_4 <- stats::lag(ts_y[, c("pi_def", "gap", "ulc", "spread", "pi_w")], k = -4)
+ZZ <- ts.union(Z_1, Z_2)
+
+# zjisteni poctu vysvetlujicich promennych a poctu instrumentu
+k_X <- dim(XX)[2]
+k_Z <- dim(ZZ)[2]
+
+# spojeni vsech promennych a odstraneni NA hodnot
+pom_data <- ts.union(yy, XX, ZZ)
+pom_data <- na.omit(pom_data)
+
+
+# definice funkce pro momentove podminky
+my_g1 <- function(my_par, x) {
+  # definice parametru
+  lambda <- my_par[1]
+  beta <- my_par[2]
+  
+  # definice rezidui -> vektor n x 1
+  e <- x[, 1] - lambda * x[, 2] - beta * x[, 3]
+  
+  # matice instrumentu Z
+  Z <- x[, (1 + k_X + 1):(1 + k_X + k_Z)]
+  
+  # matice momentovych podminek
+  # e se vynasobi (po prvcich) s kazdym sloupcem Z
+  gmat <- as.numeric(e) * Z
+  return(gmat)
+}
+
+# vytvorime matici dat (z ts objektu)
+x_mat <- matrix(pom_data, ncol = (1 + k_X + k_Z))
+
+
+lambda_0 <- -0.05   # funkce ostatnich strukturalnich parametru
+beta_0 <- 0.95      # diskontni faktor v modelu NKPC
+
+
+# defaultne se pracuje s HAC kovariancni matici
+Model_1a <- gmm(
+  my_g1,
+  x = x_mat,
+  t0 = c(lambda_0, beta_0),
+  type = "twoStep",
+  vcov = "iid"
+)
+
+s <- summary(Model_1a)
+
+jtest_riadok <- data.frame(
+  term      = c("J-test", "J-test p-hodnota"),
+  `Model 1a` = c(
+    round(s$stest$test[1, 1], 4),
+    round(s$stest$test[1, 2], 4)
+  ),
+  check.names = FALSE
+)
+
+modelsummary(
+  list("Model 1a" = Model_1a),
+  stars     = TRUE,
+  gof_map   = c("nobs"),
+  add_rows  = jtest_riadok,
+  title     = "GMM — odhady koeficientov"
+)
+```
+
+::: komentar
+Vysoká p-hodnota J-testu (0,915) spolehlivě potvrzuje validitu a exogenitu použitých instrumentů. Parametr citlivosti na náklady (Theta 1) dosáhl hodnoty 0,041, což je v souladu s teorií, nicméně tento parametr je statisticky nevýznamný. Odhad diskontního faktoru (Theta 2) sice vlivem nedávných extrémních inflačních šoků vyšel bodově mírně nad jedna (1,006), ale vzhledem ke směrodatné odchylce (0,093) se od jedničky statisticky významně neliší.
+:::
+
+```{r gmm-instruments_2}
+# GMM s dodanim matice vah
+W_Z <- na.omit(matrix(ZZ, ncol = k_Z))
+Model_1b <- gmm(
+  my_g1,
+  x = x_mat,
+  t0 = c(lambda_0, beta_0),
+  type = "twoStep",
+   vcov = "iid",
+  weightsMatrix = solve(t(W_Z) %*% W_Z)
+)
+# summary(Model_1b)
+s <- summary(Model_1b)
+
+jtest_riadok <- data.frame(
+  term      = c("J-test", "J-test p-hodnota"),
+  `Model 1b` = c(
+    round(s$stest$test[1, 1], 4),
+    round(s$stest$test[1, 2], 4)
+  ),
+  check.names = FALSE
+)
+
+modelsummary(
+  list("Model 1b" = Model_1b),
+  stars     = TRUE,
+  gof_map   = c("nobs"),
+  add_rows  = jtest_riadok,
+  title     = "GMM — odhady koeficientov"
+)
+
+```
+
+::: komentar
+Z modelu s fixními váhami zjišťuji, že parametr citlivosti na náklady (Theta 1) dosáhl hodnoty -0.039, což není v souladu s teorií, nicméně tento parametr je statisticky nevýznamný. Odhad diskontního faktoru (Theta 2) sice vlivem nedávných extrémních inflačních šoků vyšel v rámci teorie a je statisticky významný. P-hodnota J-testu potvrzuje validitu a exogenitu použitých instrumentů.
+:::
+
+### Overenie s output gap 
+
+
+```{r gmm-model2}
+
+XX <- ts.union(ts_y[, "gap"], stats::lag(ts_y[, "pi_def"], k = 1))
+
+# spojeni vsech promennych a odstraneni NA hodnot
+pom_data <- ts.union(yy, XX, ZZ)
+pom_data <- na.omit(pom_data)
+
+# vytvorime matici dat (z ts objektu)
+x_mat <- matrix(pom_data, ncol = (1 + k_X + k_Z))
+
+Model_2 <- gmm(
+  my_g1,
+  x = x_mat,
+  t0 = c(lambda_0, beta_0),
+  type = "twoStep",
+
+)
+
+# summary(Model_2)
+s <- summary(Model_2)
+
+jtest_riadok <- data.frame(
+  term      = c("J-test", "J-test p-hodnota"),
+  `Model 2` = c(
+    round(s$stest$test[1, 1], 4),
+    round(s$stest$test[1, 2], 4)
+  ),
+  check.names = FALSE
+)
+
+modelsummary(
+  list("Model 2" = Model_2),
+  stars     = TRUE,
+  gof_map   = c("nobs"),
+  add_rows  = jtest_riadok,
+  title     = "Overeni s output gap"
+)
+
+
+```
+
+::: komentar
+**Porovnanie proxy premenných:**
+
+Z p-hodnoty J-testu (0.51) víme, že model je validní a netrpí endogenitou. Theta 1 (0,099) parametr nákladů odpovídá teorii a je silně statisticky významný (p-hodnota je prakticky nula). Růst mzdových nákladů v tomto modelu prokazatelně zvyšuje inflaci. Theta 2 (1,012) parametr je mírně nad jedna, což odporuje teorii, ale vzhledem ke směrodatné odchylce (0,064) se od jedničky statisticky neliší.
+:::
+
+### Štrukturálna NKPC
+
+```{r gmm-structural}
+
+
+# prace s ulc 
+# vysvetlujici promenne, pi_def je posunuto o jedno obdobi dopredu
+XX <- ts.union(ts_y[,"ulc"],stats::lag(ts_y[,"pi_def"], k = 1))
+
+# spojeni vsech promenny a odstraneni NA hodnot  
+pom_data <- ts.union(yy,XX,ZZ)
+pom_data <- na.omit(pom_data)
+# vytvorime matici dat (z ts objektu)
+x_mat <- matrix(pom_data, ncol = (1+k_X+k_Z))  
+
+# nove momentove podminky 
+my_g2 <- function(my_par,x) {
+  # definice parametru
+  theta  <- my_par[1]
+  beta   <- my_par[2]
+  
+  # definice rezidui -> vektor n x 1
+  e <- theta*x[,1] - (1-theta)*(1-beta*theta)*x[,2] - theta*beta*x[,3]
+  # matice instrumentu Z
+  Z <- x[,(1+k_X+1):(1+k_X+k_Z)]
+  #matice momentovych podminek e se vynasobi (po prvcich) s kazdym sloupcem Z
+  gmat <- as.numeric(e)*Z
+  return(gmat)
+} 
+
+# pocatecni podminky pro theta 
+theta_0 <- 0.5
+
+Model_3 <- gmm(my_g2, x = x_mat, t0 = c(theta_0,beta_0), type = "twoStep",vcov = "iid")
+# summary(Model_3)
+
+s <- summary(Model_3)
+
+jtest_riadok <- data.frame(
+  term      = c("J-test", "J-test p-hodnota"),
+  `Model 3` = c(
+    round(s$stest$test[1, 1], 4),
+    round(s$stest$test[1, 2], 4)
+  ),
+  check.names = FALSE
+)
+
+modelsummary(
+  list("Model 3" = Model_3),
+  stars     = TRUE,
+  gof_map   = c("nobs"),
+  add_rows  = jtest_riadok,
+  title     = "Strukturalni NKPC"
+)
+
+```
+
+```{r}
+#dopocitani lambda
+theta <- coefficients(Model_3)[1]
+beta  <- coefficients(Model_3)[2]
+
+lambda <- (1-theta)*(1-beta*theta)/theta
+
+# Korelogram rezidui
+# vezmeme si odpovidajici sloupce datove matice (bez instrumentu Z)   
+x <- x_mat[,1:(1+k_X)] 
+# dle vztahu ve funkci pro momentove podminky dopocitame rezidua na zaklade
+# odhadu parametru (definovany vyse pri vypoctu lambda)
+pom_e <- theta*x[,1] - (1-theta)*(1-beta*theta)*x[,2] - theta*beta*x[,3]
+# vidime zbytkovou autokorelaci radu 1
+ggAcf(pom_e,
+      lag.max = 20,
+      linewidth = 1,
+      color = "red")
+```
+
+::: komentar
+Z p-hodnoty J-testu (p = 0.77) víme, že model je validní a netrpí endogenitou. Theta 1 ($\theta$ =0,74) parametr cenové strnulosti tzv. Calvo parametr Výsledek ukazuje, že 73,5% firem v daném čtvrdletí nezmění ceny. Theta 2 ($\beta$ = 1,078) parametr je mírně nad jedna, což odporuje teorii, ale vzhledem ke směrodatné odchylce (0,102) se od jedničky statisticky neliší. Lambda parametr ($\lambda$ = 0.0746). 
+:::
+
+```{r gmm-structural_2}
+
+# nove momentove podminky 
+my_g3 <- function(my_par,x) {
+  # definice parametru
+  theta  <- my_par[1]
+  beta   <- my_par[2]
+  
+  # definice rezidui -> vektor n x 1
+  e <- x[,1] - (theta^(-1))*(1-theta)*(1-beta*theta)*x[,2] - beta*x[,3]
+  # matice instrumentu Z
+  Z <- x[,(1+k_X+1):(1+k_X+k_Z)]
+  #matice momentovych podminek e se vynasobi (po prvcich) s kazdym sloupcem Z
+  gmat <- as.numeric(e)*Z
+  return(gmat)
+} 
+
+# pocatecni podminky pro theta ponechany
+Model_4 <- gmm(my_g3, x = x_mat, t0 = c(theta_0,beta_0), type = "twoStep", vcov = "iid")
+# summary(Model_4)
+
+s <- summary(Model_4)
+
+jtest_riadok <- data.frame(
+  term      = c("J-test", "J-test p-hodnota"),
+  `Model 4` = c(
+    round(s$stest$test[1, 1], 4),
+    round(s$stest$test[1, 2], 4)
+  ),
+  check.names = FALSE
+)
+
+modelsummary(
+  list("Model 4" = Model_4),
+  stars     = TRUE,
+  gof_map   = c("nobs"),
+  add_rows  = jtest_riadok,
+  title     = "Strukturalni NKPC"
+)
+
+```
+
+```{r}
+#dopocitani lambda
+theta <- coefficients(Model_4)[1]
+beta  <- coefficients(Model_4)[2]
+
+lambda <- (1-theta)*(1-beta*theta)/theta
+
+# Korelogram rezidui
+# vezmeme si odpovidajici sloupce datove matice (bez instrumentu Z)   
+x <- x_mat[,1:(1+k_X)] 
+# dle vztahu ve funkci pro momentove podminky dopocitame rezidua na zaklade
+# odhadu parametru (definovany vyse pri vypoctu lambda)
+pom_e <- theta*x[,1] - (1-theta)*(1-beta*theta)*x[,2] - theta*beta*x[,3]
+# vidime zbytkovou autokorelaci radu 1
+ggAcf(pom_e,
+      lag.max = 20,
+      size = 1,
+      color = "steelblue")
+```
+
+::: komentar
+**Interpretácia štrukturálnych odhadov:**
+
+J-test (p = 0,949) instrumenty jsou validní a striktně exogenní.Theta 1 ($\theta$ = 0,788) Calvo parametr je silně statisticky významný. Zhruba 78,8 % firem v daném čtvrtletí nemění ceny. Theta 2 ($\beta$ = 1,033) diskontní faktor je vysoce významný. Bodově leží těsně nad jedna, ale díky směrodatné odchylce (0,095) se od teoretické hodnoty 1 statisticky neliší.Lambda ($\lambda$ = 0,050) znamená plochou Phillipsovu křivku, to znamená, že centrální banka, musí výrazně intervenovat, aby snížila inflaci.
+:::
+
+### Hybridná NKPC – redukovaná forma 
+$$ \pi_t = \lambda mc_t + \gamma_f E_t\{\pi_{t+1}\} + \gamma_b \pi_{t-1} + u_t $$
+
+```{r gmm-hybrid-reduced}
+
+XX <- ts.union(ts_y[,"ulc"],stats::lag(ts_y[,"pi_def"], k = 1),
+               stats::lag(ts_y[,"pi_def"], k = -1))
+k_X <- dim(XX)[2]  
+# spojeni vsech promenny a odstraneni NA hodnot  
+pom_data <- ts.union(yy,XX,ZZ)
+pom_data <- na.omit(pom_data)
+# vytvorime matici dat (z ts objektu)
+x_mat <- matrix(pom_data, ncol = (1+k_X+k_Z))  
+
+# nove momentove podminky 
+my_g4 <- function(my_par,x) {
+  # definice parametru
+  lambda  <- my_par[1]
+  gamma_f <- my_par[2]
+  gamma_b <- my_par[3]
+  
+  # definice rezidui -> vektor n x 1
+  e <- x[,1] - lambda*x[,2] - gamma_f*x[,3] - gamma_b*x[,4]
+  # matice instrumentu Z
+  Z <- x[,(1+k_X+1):(1+k_X+k_Z)]
+  #matice momentovych podminek e se vynasobi (po prvcich) s kazdym sloupcem Z
+  gmat <- as.numeric(e)*Z
+  return(gmat)
+}   
+
+# doplneni pocatecnich hodnot  
+lambda_0 <- 0.05
+gamma_f_0 <- 0.65
+gamma_b_0 <- 0.35
+
+#Model_5 <- gmm(my_g4, x = x_mat, t0 = c(lambda_0,gamma_f_0,gamma_b_0), type = "twoStep")
+#summary(Model_5)
+#Model_5 <- gmm(my_g4, x = x_mat, t0 = c(lambda_0,gamma_f_0,gamma_b_0), type = "iterative")
+#summary(Model_5)
+Model_5 <- gmm(my_g4, x = x_mat, t0 = c(lambda_0,gamma_f_0,gamma_b_0), type = "cue", vcov = "iid")
+# summary(Model_5)
+
+s <- summary(Model_5)
+
+jtest_riadok <- data.frame(
+  term      = c("J-test", "J-test p-hodnota"),
+  `Model 5` = c(
+    round(s$stest$test[1, 1], 4),
+    round(s$stest$test[1, 2], 4)
+  ),
+  check.names = FALSE
+)
+
+modelsummary(
+  list("Model 5" = Model_5),
+  stars     = TRUE,
+  gof_map   = c("nobs"),
+  add_rows  = jtest_riadok,
+  title     = "Hybridná NKPC – redukovaná forma"
+)
+
+```
+
+```{r}
+
+
+lambda  <- coefficients(Model_5)[1]
+gamma_f <- coefficients(Model_5)[2]
+gamma_b <- coefficients(Model_5)[3]
+
+# Korelogram rezidui
+# vezmeme si odpovidajici sloupce datove matice (bez instrumentu Z)   
+x <- x_mat[,1:(1+k_X)] 
+# dle vztahu ve funkci pro momentove podminky dopocitame rezidua na zaklade
+# odhadu parametru (definovany vyse)
+pom_e <- x[,1] - lambda*x[,2] - gamma_f*x[,3] - gamma_b*x[,4]
+# vidime stale zbytkovou autokorelaci radu 1
+ggAcf(pom_e,
+      lag.max = 20,
+      size = 1,
+      color = "#9F16E9")
+
+```
+
+::: komentar
+**Interpretácia hybridnej NKPC (redukovaná forma):**
+
+J-test (p = 0,675) instrumenty jsou validní a exogenní.Theta 1 ($\lambda$ = 0,235) je citlivost na náklady. Má správné kladné znaménko a je statisticky významná na 10% hladině spolehlivosti (p = 0,075).Theta 2 ($\gamma_f$ = 0,892) je váha očekávané budoucí inflace. Hodnota tohoto parametru odpovídá teorii a je vysoce statisticky významný.Theta 3 ($\gamma_b$ = 0,145) je váha minulé inflace. Vyšla kladná, ale je statisticky nevýznamná (p = 0,332).
+:::
+
+### Hybridná NKPC – štrukturálna forma 
+
+Odhadované parametre: **θ, β, ω** → dopočítané φ, λ, γ_f, γ_b.
+
+```{r gmm-hybrid-structural}
+
+# nove momentove podminky 
+my_g5 <- function(my_par,x) {
+  # definice parametru
+  theta  <- my_par[1]
+  beta   <- my_par[2]
+  omega  <- my_par[3]
+  
+  phi     <- theta+omega*(1-theta*(1-beta))
+  lambda  <- (1-omega)*(1-theta)*(1-beta*theta)*phi^-1
+  gamma_f <- beta*theta*phi^-1
+  gamma_b <- omega*phi^-1     
+  
+  # definice rezidui -> vektor n x 1
+  e <- x[,1] - lambda*x[,2] - gamma_f*x[,3] - gamma_b*x[,4]
+  # matice instrumentu Z
+  Z <- x[,(1+k_X+1):(1+k_X+k_Z)]
+  #matice momentovych podminek e se vynasobi (po prvcich) s kazdym sloupcem Z
+  gmat <- as.numeric(e)*Z
+  return(gmat)
+}    
+
+
+# nove pocatecni hodnoty pro omega
+omega_0 <- 0.5
+
+
+#Model_6 <- gmm(my_g5, x = x_mat, t0 = c(theta_0,beta_0,omega_0), type = "twoStep", vcov = "iid")
+#summary(Model_6)
+#Model_6 <- gmm(my_g5, x = x_mat, t0 = c(theta_0,beta_0,omega_0), type = "iterative")
+#summary(Model_6)
+Model_6 <- gmm(my_g5, x = x_mat, t0 = c(theta_0,beta_0,omega_0), type = "cue", vcov = "iid")
+# summary(Model_6)
+
+s <- summary(Model_6)
+
+jtest_riadok <- data.frame(
+  term      = c("J-test", "J-test p-hodnota"),
+  `Model 6` = c(
+    round(s$stest$test[1, 1], 4),
+    round(s$stest$test[1, 2], 4)
+  ),
+  check.names = FALSE
+)
+
+modelsummary(
+  list("Model 6" = Model_6),
+  stars     = TRUE,
+  gof_map   = c("nobs"),
+  add_rows  = jtest_riadok,
+  title     = "Hybridná NKPC – štrukturálna forma"
+)
+
+```
+
+```{r}
+theta    <- coefficients(Model_6)[1]
+beta     <- coefficients(Model_6)[2]
+omega    <- coefficients(Model_6)[3]
+
+# dopocitani ostatnich koeficientu
+phi      <- theta+omega*(1-theta*(1-beta))
+lambda   <- (1-omega)*(1-theta)*(1-beta*theta)*phi^-1
+gamma_f  <- beta*theta*phi^-1
+gamma_b  <- omega*phi^-1     
+
+# Korelogram rezidui
+# vezmeme si odpovidajici sloupce datove matice (bez instrumentu Z)   
+x <- x_mat[,1:(1+k_X)] 
+# dle vztahu ve funkci pro momentove podminky dopocitame rezidua na zaklade
+# odhadu parametru (definovany vyse)
+pom_e <- x[,1] - lambda*x[,2] - gamma_f*x[,3] - gamma_b*x[,4]
+# vidime stale zbytkovou autokorelaci radu 1
+ggAcf(pom_e,
+      lag.max = 20,
+      linewidth = 1,
+      color = "#0D401B") 
+```
+
+::: komentar
+**Interpretácia hybridnej NKPC (štrukturálna forma):**
+J-test (p = 0,675)instrumenty jsou validní a exogenní.Theta 1 ($\theta$ = 0,568), Calvo parametr je vysoce statisticky významný. Zhruba 56,8 % firem nemění v daném čtvrtletí ceny (fixace na cca 2,3 čtvrtletí).Theta 2 ($\beta$ = 1,048) je diskontní faktor, který je vysoce významný, bodově nad jedna, ale díky odchylce (0,193) se statisticky neliší od teoretické hodnoty 1.Theta 3 ($\omega$ = 0,097) je podíl firem hledících vzad (rule-of-thumb).Tento parametr je statisticky nevýznamný (p = 0,327).
+:::
+
+
+## Príklad 2.3: Obmedzené modely pre β = 1 a test dlhodobej vertikality
+
+Dlhodobá vertikalita NKPC zodpovedá obmedzeniu $\beta = 1$ v základnej forme,
+resp. $\gamma_f + \gamma_b = 1$ v hybridnej forme. Odhadujeme obmedzené verzie
+modelov a testujeme túto hypotézu.
+
+```{r gmm-restricted}
+library(car)
+
+# ── 1. Obmedzený Model_1a_r: základná NKPC, β = 1 ────────────────────────────
+XX  <- ts.union(ts_y[, "ulc"], stats::lag(ts_y[, "pi_def"], k = 1))
+k_X <- dim(XX)[2]
+pom_data    <- na.omit(ts.union(yy, XX, ZZ))
+x_mat_base  <- matrix(pom_data, ncol = (1 + k_X + k_Z))
+
+my_g1_r <- function(my_par, x) {
+  lambda <- my_par[1]
+  beta   <- 1
+  e      <- x[, 1] - lambda * x[, 2] - beta * x[, 3]
+  Z      <- x[, (1 + k_X + 1):(1 + k_X + k_Z)]
+  as.numeric(e) * Z
+}
+
+Model_1a_r <- gmm(my_g1_r, x = x_mat_base, t0 = c(lambda_0), type = "twoStep")
+summary(Model_1a_r)
+
+# ── 2. Obmedzený Model_5_r: hybridná NKPC (redukovaná forma), β = 1 ───────────
+XX  <- ts.union(ts_y[, "ulc"],
+                stats::lag(ts_y[, "pi_def"], k =  1),
+                stats::lag(ts_y[, "pi_def"], k = -1))
+k_X <- dim(XX)[2]
+pom_data   <- na.omit(ts.union(yy, XX, ZZ))
+x_mat_hyb  <- matrix(pom_data, ncol = (1 + k_X + k_Z))
+
+my_g4_r <- function(my_par, x) {
+  lambda  <- my_par[1]
+  gamma_f <- my_par[2]
+  gamma_b <- my_par[3]
+  e       <- x[, 1] - lambda * x[, 2] - gamma_f * x[, 3] - gamma_b * x[, 4]
+  Z       <- x[, (1 + k_X + 1):(1 + k_X + k_Z)]
+  as.numeric(e) * Z
+}
+
+Model_5_r <- gmm(my_g4_r, x = x_mat_hyb,
+                 t0 = c(lambda_0, gamma_f_0, gamma_b_0), type = "cue")
+summary(Model_5_r)
+
+# ── 3. Obmedzený Model_6_r: hybridná NKPC (štrukturálna forma), β = 1 ─────────
+my_g5_r <- function(my_par, x) {
+  theta   <- my_par[1]
+  beta    <- 1
+  omega   <- my_par[2]
+  phi     <- theta + omega * (1 - theta * (1 - beta))
+  lambda  <- (1 - omega) * (1 - theta) * (1 - beta * theta) * phi^-1
+  gamma_f <- beta * theta * phi^-1
+  gamma_b <- omega * phi^-1
+  e       <- x[, 1] - lambda * x[, 2] - gamma_f * x[, 3] - gamma_b * x[, 4]
+  Z       <- x[, (1 + k_X + 1):(1 + k_X + k_Z)]
+  as.numeric(e) * Z
+}
+
+Model_6_r <- gmm(my_g5_r, x = x_mat_hyb,
+                 t0 = c(theta_0, omega_0), type = "cue")
+summary(Model_6_r)
+
+# ── 4. Waldov test dlhodobej vertikality na Model_5_r ─────────────────────────
+# linearHypothesis nefunguje priamo na gmm objekte
+# → manuálny Wald test: H0: γ_f + γ_b = 1
+coef_5r <- coef(Model_5_r)
+vcov_5r <- vcov(Model_5_r)
+
+# kontrastný vektor pre γ_f + γ_b (Theta[2] + Theta[3])
+R     <- matrix(c(0, 1, 1), nrow = 1)
+r     <- 1
+Rbeta <- R %*% coef_5r - r
+W     <- as.numeric(t(Rbeta) %*% solve(R %*% vcov_5r %*% t(R)) %*% Rbeta)
+p_W   <- pchisq(W, df = 1, lower.tail = FALSE)
+
+wald_df <- data.frame(
+  Hypotéza        = "γ_f + γ_b = 1",
+  `Wald χ²`       = round(W, 4),
+  `Stupne voľn.`  = 1,
+  `p-hodnota`     = formatC(p_W, format = "e", digits = 4)
+)
+knitr::kable(wald_df,
+             caption = "Waldov test dlhodobej vertikality NKPC (Model_5_r)",
+             align   = c("l", "r", "c", "r"))
+
+# ── 5. Prehľadová tabuľka odhadov obmedzených modelov ─────────────────────────
+# koeficienty a dopočítané hodnoty pre štrukturálny model
+theta_r  <- coef(Model_6_r)[1]
+omega_r  <- coef(Model_6_r)[2]
+beta_r   <- 1
+phi_r    <- theta_r + omega_r * (1 - theta_r * (1 - beta_r))
+lambda_r <- (1 - omega_r) * (1 - theta_r) * (1 - beta_r * theta_r) * phi_r^-1
+gf_r     <- beta_r * theta_r * phi_r^-1
+gb_r     <- omega_r * phi_r^-1
+
+res_table <- data.frame(
+  Model = c("Model_1a_r (základ., β=1)",
+            "Model_5_r (hybrid. red., β=1)",
+            "Model_6_r (hybrid. štruk., β=1)"),
+  lambda  = round(c(unname(coef(Model_1a_r)[1]),
+                    unname(coef(Model_5_r)[1]),
+                    lambda_r), 4),
+  gamma_f = c(NA,
+              round(unname(coef(Model_5_r)[2]), 4),
+              round(gf_r, 4)),
+  gamma_b = c(NA,
+              round(unname(coef(Model_5_r)[3]), 4),
+              round(gb_r, 4)),
+  sum_gfgb = c(NA,
+               round(sum(coef(Model_5_r)[2:3]), 4),
+               round(gf_r + gb_r, 4)),
+  J_pval  = c(
+    formatC(specTest(Model_1a_r)$test[2], format = "e", digits = 3),
+    formatC(specTest(Model_5_r)$test[2],  format = "e", digits = 3),
+    formatC(specTest(Model_6_r)$test[2],  format = "e", digits = 3)
+  )
+)
+knitr::kable(res_table,
+             col.names = c("Model", "$\\lambda$", "$\\gamma_f$", "$\\gamma_b$",
+                           "$\\gamma_f + \\gamma_b$", "J-test $p$"),
+             caption   = "Obmedzené modely ($\\beta = 1$) – prehľad odhadov",
+             align     = c("l", "r", "r", "r", "r", "r"))
+```
+
+::: komentar
+**Test dlhodobej vertikality (GMM):**
+
+V základnej redukovanej forme (Model_1a_r, $\beta = 1$) zostáva
+$\hat\lambda = 0.0125$, ktorý nie je štatisticky významný ($p = 0.384$).
+J-test model **zamieta na hladine 1 %** ($p = 1.55 \times 10^{-26}$) –
+obmedzenie $\beta = 1$ je teda v rozpore s dátami.
+
+V hybridnej redukovanej forme (Model_5_r) sú všetky koeficienty
+vysoko významné: $\hat\lambda = 0.479$, $\hat\gamma_f = 0.694$,
+$\hat\gamma_b = 0.741$, pričom $\hat\gamma_f + \hat\gamma_b = 1.435$.
+Waldov test hypotézy $H_0\colon \gamma_f + \gamma_b = 1$ dáva
+$\chi^2 = 18.02$ ($p = 2.19 \times 10^{-5}$) – hypotézu dlhodobej
+vertikality **zamietame na hladine 1 %**. J-test navyše model
+**zamieta** ($p = 1.93 \times 10^{-16}$).
+
+V hybridnej štrukturálnej forme (Model_6_r, $\beta = 1$) dostávame
+$\hat\theta = 0.099$ ($p = 0.047$) a $\hat\omega = 0.611$ ($p \approx 0$),
+pričom dopočítaný súčet $\hat\gamma_f + \hat\gamma_b = 1.000$ –
+dlhodobá vertikalita je tu splnená konštrukčne (dôsledok $\beta = 1$).
+J-test však model **zamieta** ($p = 2.33 \times 10^{-20}$), a hodnota
+$\hat\theta = 0.099$ je v príkrom rozpore s neobmedzeným odhadom
+$\hat\theta \approx 0.86$, čo signalizuje, že obmedzenie $\beta = 1$
+štrukturálny model destabilizuje.
+
+**Záver:** Všetky tri obmedzené modely sú J-testom zamietnuté,
+pričom Waldov test v hybridnej redukovanej forme navyše priamo zamieta
+$\gamma_f + \gamma_b = 1$ ($p = 2.19 \times 10^{-5}$). Dlhodobá
+vertikalita NKPC pre Francúzsko **nie je štatisticky podporená**.
+:::
+
+
+## Príklad 2.4: Odhady NLS a ML
+
+### NLS odhady
+
+```{r nls-setup}
+# Príprava dát pre NLS odhady (základné a hybridné modely)
+# Vytvoríme jednoduchší dataset bez instrumentov
+
+# Základná NKPC: π_t = λ*ulc_t + β*π_{t+1}
+X_base <- ts.union(ts_y[, "ulc"], stats::lag(ts_y[, "pi_def"], k = -1))
+Y_base <- ts_y[, "pi_def"]
+data_base <- na.omit(ts.union(Y_base, X_base))
+
+# Hybridná NKPC: π_t = λ*ulc_t + γ_f*π_{t+1} + γ_b*π_{t-1}
+X_hybrid <- ts.union(ts_y[, "ulc"], 
+                     stats::lag(ts_y[, "pi_def"], k = -1),
+                     stats::lag(ts_y[, "pi_def"], k = 1))
+Y_hybrid <- ts_y[, "pi_def"]
+data_hybrid <- na.omit(ts.union(Y_hybrid, X_hybrid))
+
+# Konverzia na data.frame pre jednoduchšiu prácu
+df_base <- data.frame(data_base)
+colnames(df_base) <- c("pi_def", "ulc", "pi_f")
+
+df_hybrid <- data.frame(data_hybrid)
+colnames(df_hybrid) <- c("pi_def", "ulc", "pi_f", "pi_b")
+```
+
+```{r nls-basic}
+# ── 1. NLS odhad základnej NKPC (redukovaná forma) ──────────────────────────
+# Model: π_t = λ*ulc_t + β*π_{t+1} + ε_t
+
+nls_basic <- nls(pi_def ~ lambda * ulc + beta * pi_f,
+                 data = df_base,
+                 start = list(lambda = 0.05, beta = 0.95),
+                 control = list(warnOnly = TRUE, maxiter = 1000))
+
+summary_nls_basic <- summary(nls_basic)
+summary_nls_basic
+
+# Residuálny rozptyl a logveľmoznosť pre NLS
+rss_nls_basic <- sum(residuals(nls_basic)^2)
+n_nls_basic <- nrow(df_base)
+sigma_sq_nls_basic <- rss_nls_basic / n_nls_basic
+ll_nls_basic <- -n_nls_basic/2 * log(sigma_sq_nls_basic) - rss_nls_basic / (2 * sigma_sq_nls_basic)
+
+```
+
+::: komentar
+**NLS odhad základnej NKPC:**
+
+NLS odhad bez kontroly na endogenitu poskytuje podobné bodové odhady ako GMM, ale s tým rozdielom, že NLS sa nejedná o asymptoticky efektívny odhad. Parametr λ vyšiel kladný a s podobnou veľkosťou ako v GMM odhade. Parametr β je blízko 0,95, čo svedčí o budúcej inflácii. Rezidálny rozptyl je podstatne vyšší ako pri GMM, čo naznačuje, že OLS-typ odhadu nie je optimálny pri prítomnosti endogenity.
+:::
+
+```{r nls-hybrid}
+# ── 2. NLS odhad hybridnej NKPC (redukovaná forma) ──────────────────────────
+# Model: π_t = λ*ulc_t + γ_f*π_{t+1} + γ_b*π_{t-1} + ε_t
+
+nls_hybrid <- nls(pi_def ~ lambda * ulc + gamma_f * pi_f + gamma_b * pi_b,
+                  data = df_hybrid,
+                  start = list(lambda = 0.05, gamma_f = 0.65, gamma_b = 0.35),
+                  control = list(warnOnly = TRUE, maxiter = 1000))
+
+summary_nls_hybrid <- summary(nls_hybrid)
+summary_nls_hybrid
+
+# Residuálny rozptyl a logveľmoznosť pre NLS
+rss_nls_hybrid <- sum(residuals(nls_hybrid)^2)
+n_nls_hybrid <- nrow(df_hybrid)
+sigma_sq_nls_hybrid <- rss_nls_hybrid / n_nls_hybrid
+ll_nls_hybrid <- -n_nls_hybrid/2 * log(sigma_sq_nls_hybrid) - rss_nls_hybrid / (2 * sigma_sq_nls_hybrid)
+
+```
+
+::: komentar
+**NLS odhad hybridnej NKPC:**
+
+Hybridný NLS model zachytáva tak dopredu ako aj spätne pozorujúce sa správanie. Parametre sú všetky štatisticky významné na 5% hladine. Súčet γ_f + γ_b je blízko 1, čo podporuje koncept dlhodobej vertikality. Akonáhle sa zavedú dodatočné parametre (γ_f, γ_b), model sa lepšie prispôsobuje dátam (nižší rezidálny rozptyl).
+:::
+
+```{r nls-restricted}
+# ── 3. NLS obmedzený model (β = 1 alebo γ_f + γ_b = 1) ──────────────────────
+
+# Vytvoríme vzorec s obmedzeným β
+nls_basic_r <- nls(pi_def ~ lambda * ulc + 1 * pi_f,
+                   data = df_base,
+                   start = list(lambda = 0.05),
+                   control = list(warnOnly = TRUE, maxiter = 1000))
+
+summary_nls_basic_r <- summary(nls_basic_r)
+summary_nls_basic_r
+
+rss_nls_basic_r <- sum(residuals(nls_basic_r)^2)
+n_nls_basic_r <- nrow(df_base)
+sigma_sq_nls_basic_r <- rss_nls_basic_r / n_nls_basic_r
+ll_nls_basic_r <- -n_nls_basic_r/2 * log(sigma_sq_nls_basic_r) - rss_nls_basic_r / (2 * sigma_sq_nls_basic_r)
+
+# Pre hybridný model s obmedzeníem
+# Vzorec: π_t = λ*ulc_t + γ_f*π_{t+1} + (1-γ_f)*π_{t-1}
+# Teda: π_t = λ*ulc_t + γ_f*(π_{t+1} - π_{t-1}) + π_{t-1}
+
+nls_hybrid_r <- nls(pi_def ~ lambda * ulc + gamma_f * (pi_f - pi_b) + pi_b,
+                    data = df_hybrid,
+                    start = list(lambda = 0.05, gamma_f = 0.65),
+                    control = list(warnOnly = TRUE, maxiter = 1000))
+
+summary_nls_hybrid_r <- summary(nls_hybrid_r)
+summary_nls_hybrid_r
+
+rss_nls_hybrid_r <- sum(residuals(nls_hybrid_r)^2)
+n_nls_hybrid_r <- nrow(df_hybrid)
+sigma_sq_nls_hybrid_r <- rss_nls_hybrid_r / n_nls_hybrid_r
+ll_nls_hybrid_r <- -n_nls_hybrid_r/2 * log(sigma_sq_nls_hybrid_r) - rss_nls_hybrid_r / (2 * sigma_sq_nls_hybrid_r)
+
+```
+
+::: komentar
+**NLS obmedzené modely:**
+
+V obmedzenej základnej forme (β = 1) parametr λ sa približuje 0, čo je silne štatisticky nevýznamné. RSS výrazne rastie v porovnaní s neobmedzeným modelom.
+
+V obmedzenej hybridnej forme (γ_f + γ_b = 1) je oblastný rozptyl vysoko štatisticky významný, čo svedčí o tom, že obmedzenie γ_f + γ_b = 1 je v rozpore s dátami. RSS sa zvýšil v porovnaní s neobmedzeným modelom, čo potvrdzuje, že dáta jasne uprednostňujú neobmedzené odhady.
+:::
+
+### ML odhady (normálne rozdelenie)
+
+```{r ml-normal}
+# ── 1. ML odhad s normálnym rozdelením – základná NKPC ──────────────────────
+
+# Definícia negatívnej log-veľmoznosti (pre minimalizáciu)
+ll_norm_basic <- function(par, y, X) {
+  lambda <- par[1]
+  beta <- par[2]
+  sigma <- par[3]
+  
+  if (sigma <= 0) return(1e10)
+  
+  # Predpovedané hodnoty
+  y_pred <- lambda * X[, 1] + beta * X[, 2]
+  # Rezidua
+  resid <- y - y_pred
+  # Log-veľmoznosť
+  -sum(dnorm(resid, mean = 0, sd = sigma, log = TRUE))
+}
+
+# Príprava matice vysvětlujúcich premenných
+X_base_mat <- cbind(df_base$ulc, df_base$pi_f)
+y_base <- df_base$pi_def
+
+# Odhad pomocou maxLik
+ml_norm_basic <- maxLik(ll_norm_basic, 
+                        start = c(lambda = 0.05, beta = 0.95, sigma = 0.01),
+                        y = y_base, X = X_base_mat,
+                        method = "BFGS")
+
+summary_ml_norm_basic <- summary(ml_norm_basic)
+summary_ml_norm_basic
+
+# Logveľmoznosť
+ll_value_ml_norm_basic <- -ml_norm_basic$maximum
+```
+
+::: komentar
+**ML odhad s normálnym rozdelením (základná NKPC):**
+
+ML odhad s předpokladem normality náhodných chyb poskytuje asymptoticky efektivní odhady. Parametry sú úmerne vypočítané z empirických dát. Odhady λ a β sú blízko tým z NLS, ale odhad σ poskytuje lepší vhľad do variability inflačného procesu. Hodnota ML LL je použitá na porovnanie s obmedzeným modelom prostredníctvom LR testu.
+:::
+
+```{r ml-normal-hybrid}
+# ── 2. ML odhad s normálnym rozdelením – hybridná NKPC ──────────────────────
+
+# Definícia negatívnej log-veľmoznosti
+ll_norm_hybrid <- function(par, y, X) {
+  lambda <- par[1]
+  gamma_f <- par[2]
+  gamma_b <- par[3]
+  sigma <- par[4]
+  
+  if (sigma <= 0) return(1e10)
+  
+  # Predpovedané hodnoty
+  y_pred <- lambda * X[, 1] + gamma_f * X[, 2] + gamma_b * X[, 3]
+  # Rezidua
+  resid <- y - y_pred
+  # Log-veľmoznosť
+  -sum(dnorm(resid, mean = 0, sd = sigma, log = TRUE))
+}
+
+# Príprava dát
+X_hybrid_mat <- cbind(df_hybrid$ulc, df_hybrid$pi_f, df_hybrid$pi_b)
+y_hybrid <- df_hybrid$pi_def
+
+# Odhad
+ml_norm_hybrid <- maxLik(ll_norm_hybrid,
+                         start = c(lambda = 0.05, gamma_f = 0.65, gamma_b = 0.35, sigma = 0.01),
+                         y = y_hybrid, X = X_hybrid_mat,
+                         method = "BFGS")
+
+summary_ml_norm_hybrid <- summary(ml_norm_hybrid)
+summary_ml_norm_hybrid
+
+# Logveľmoznosť
+ll_value_ml_norm_hybrid <- -ml_norm_hybrid$maximum
+```
+
+### ML odhady (t-rozdelenie)
+
+```{r ml-t}
+# ── 3. ML odhad s t-rozdelením – základná NKPC ──────────────────────────────
+
+# Definícia negatívnej log-veľmoznosti s t-rozdelením
+ll_t_basic <- function(par, y, X) {
+  lambda <- par[1]
+  beta <- par[2]
+  sigma <- par[3]
+  nu <- par[4]  # Stupeň voľnosti
+  
+  if (sigma <= 0 || nu <= 2) return(1e10)
+  
+  # Predpovedané hodnoty
+  y_pred <- lambda * X[, 1] + beta * X[, 2]
+  # Rezidua
+  resid <- y - y_pred
+  # Log-veľmoznosť s t-rozdelením
+  -sum(dt(resid / sigma, df = nu, log = TRUE) - log(sigma))
+}
+
+# Odhad pomocou maxLik
+ml_t_basic <- maxLik(ll_t_basic,
+                     start = c(lambda = 0.05, beta = 0.95, sigma = 0.01, nu = 10),
+                     y = y_base, X = X_base_mat,
+                     method = "BFGS")
+
+summary_ml_t_basic <- summary(ml_t_basic)
+summary_ml_t_basic
+
+# Logveľmoznosť
+ll_value_ml_t_basic <- -ml_t_basic$maximum
+```
+
+::: komentar
+**ML odhad s t-rozdelením (základná NKPC):**
+
+T-rozdelenie umožňuje zachytiť ťažké chvosty v distribúcii chýb, čo je relevantné pri prítomnosti extrémnych pozorovaní. Odhad ν (stupňa voľnosti) je kritický: ak je ν blízko k nekonečnu, model sa priblíža k normálnemu rozdeleniu. Nižšia hodnota ν indikuje ťažšie chvosty a vyššiu pravdepodobnosť extrémnych hodnôt.
+:::
+
+```{r ml-t-hybrid}
+# ── 4. ML odhad s t-rozdelením – hybridná NKPC ──────────────────────────────
+
+# Definícia negatívnej log-veľmoznosti
+ll_t_hybrid <- function(par, y, X) {
+  lambda <- par[1]
+  gamma_f <- par[2]
+  gamma_b <- par[3]
+  sigma <- par[4]
+  nu <- par[5]
+  
+  if (sigma <= 0 || nu <= 2) return(1e10)
+  
+  # Predpovedané hodnoty
+  y_pred <- lambda * X[, 1] + gamma_f * X[, 2] + gamma_b * X[, 3]
+  # Rezidua
+  resid <- y - y_pred
+  # Log-veľmoznosť
+  -sum(dt(resid / sigma, df = nu, log = TRUE) - log(sigma))
+}
+
+# Odhad
+ml_t_hybrid <- maxLik(ll_t_hybrid,
+                      start = c(lambda = 0.05, gamma_f = 0.65, gamma_b = 0.35, sigma = 0.01, nu = 10),
+                      y = y_hybrid, X = X_hybrid_mat,
+                      method = "BFGS")
+
+summary_ml_t_hybrid <- summary(ml_t_hybrid)
+summary_ml_t_hybrid
+
+# Logveľmoznosť
+ll_value_ml_t_hybrid <- -ml_t_hybrid$maximum
+```
+
+### ML omezené modely (β = 1, resp. γ_f + γ_b = 1)
+
+```{r ml-restricted}
+# ── 5. ML odhady obmedzeného základného modelu ────────────────────────────────
+
+# ML s normálnym rozdelením, β = 1
+ll_norm_basic_r <- function(par, y, X) {
+  lambda <- par[1]
+  sigma <- par[2]
+  
+  if (sigma <= 0) return(1e10)
+  
+  y_pred <- lambda * X[, 1] + 1 * X[, 2]
+  resid <- y - y_pred
+  -sum(dnorm(resid, mean = 0, sd = sigma, log = TRUE))
+}
+
+ml_norm_basic_r <- maxLik(ll_norm_basic_r,
+                          start = c(lambda = 0.05, sigma = 0.01),
+                          y = y_base, X = X_base_mat,
+                          method = "BFGS")
+
+ll_value_ml_norm_basic_r <- -ml_norm_basic_r$maximum
+
+# ML s t-rozdelením, β = 1
+ll_t_basic_r <- function(par, y, X) {
+  lambda <- par[1]
+  sigma <- par[2]
+  nu <- par[3]
+  
+  if (sigma <= 0 || nu <= 2) return(1e10)
+  
+  y_pred <- lambda * X[, 1] + 1 * X[, 2]
+  resid <- y - y_pred
+  -sum(dt(resid / sigma, df = nu, log = TRUE) - log(sigma))
+}
+
+ml_t_basic_r <- maxLik(ll_t_basic_r,
+                       start = c(lambda = 0.05, sigma = 0.01, nu = 10),
+                       y = y_base, X = X_base_mat,
+                       method = "BFGS")
+
+ll_value_ml_t_basic_r <- -ml_t_basic_r$maximum
+
+# ── 6. ML odhady obmedzeného hybridného modelu ────────────────────────────────
+
+# ML s normálnym rozdelením, γ_f + γ_b = 1
+ll_norm_hybrid_r <- function(par, y, X) {
+  lambda <- par[1]
+  gamma_f <- par[2]
+  sigma <- par[3]
+  
+  if (sigma <= 0) return(1e10)
+  
+  gamma_b <- 1 - gamma_f
+  y_pred <- lambda * X[, 1] + gamma_f * X[, 2] + gamma_b * X[, 3]
+  resid <- y - y_pred
+  -sum(dnorm(resid, mean = 0, sd = sigma, log = TRUE))
+}
+
+ml_norm_hybrid_r <- maxLik(ll_norm_hybrid_r,
+                           start = c(lambda = 0.05, gamma_f = 0.65, sigma = 0.01),
+                           y = y_hybrid, X = X_hybrid_mat,
+                           method = "BFGS")
+
+ll_value_ml_norm_hybrid_r <- -ml_norm_hybrid_r$maximum
+
+# ML s t-rozdelením, γ_f + γ_b = 1
+ll_t_hybrid_r <- function(par, y, X) {
+  lambda <- par[1]
+  gamma_f <- par[2]
+  sigma <- par[3]
+  nu <- par[4]
+  
+  if (sigma <= 0 || nu <= 2) return(1e10)
+  
+  gamma_b <- 1 - gamma_f
+  y_pred <- lambda * X[, 1] + gamma_f * X[, 2] + gamma_b * X[, 3]
+  resid <- y - y_pred
+  -sum(dt(resid / sigma, df = nu, log = TRUE) - log(sigma))
+}
+
+ml_t_hybrid_r <- maxLik(ll_t_hybrid_r,
+                        start = c(lambda = 0.05, gamma_f = 0.65, sigma = 0.01, nu = 10),
+                        y = y_hybrid, X = X_hybrid_mat,
+                        method = "BFGS")
+
+ll_value_ml_t_hybrid_r <- -ml_t_hybrid_r$maximum
+```
+
+::: komentar
+**ML odhady (normálne a t-rozdelenie):**
+
+Porovnanie ML odhadov s normálnym a t-rozdelením poskytuje test robustnosti voči extrémnym pozorovaniam. Ak je odhad ν značne nižší ako nekonečno, indikuje to ťažké chvosty v chybovom člene. Všetky ML odhady sú asymptoticky efektivní, ale ich konečnosť závisí od správneho špecifikácie rozdelenia.
+
+**Porovnanie s NLS:**
+NLS odhady sú menej efektívne, pretože neuvádzajú formu distribúcie chýb. Ale ak je špecifikácia chýbna (napr. t-rozdelenie namiesto normálneho), NLS môže byť robustnejší. GMM odhady nezávisia od špecifikácie distribúcie, čo ich činí veľmi flexibilnými.
+:::
+
+
+## Príklad 2.5: Porovnanie metód a LR testy dlhodobej vertikality
+
+### LR testy – základné modely
+
+```{r lr-tests-basic}
+# ── 1. LR test pre NLS – základná NKPC (H0: β = 1) ──────────────────────────
+
+# RSS pre neobmedzený a obmedzený model
+rss_nls_unrestr <- rss_nls_basic
+rss_nls_restr <- rss_nls_basic_r
+
+# LR test (založený na RSS)
+# LR = n * [log(RSS_r/n) - log(RSS_u/n)]
+n <- n_nls_basic
+lr_nls_basic <- n * (log(rss_nls_restr / n) - log(rss_nls_unrestr / n))
+p_lr_nls_basic <- pchisq(lr_nls_basic, df = 1, lower.tail = FALSE)
+
+lr_nls_basic_df <- data.frame(
+  Method = "NLS (normálne)",
+  Model = "Základná NKPC",
+  Hypotéza = "H0: β = 1",
+  LR_stat = round(lr_nls_basic, 4),
+  df = 1,
+  p_value = formatC(p_lr_nls_basic, format = "e", digits = 4)
+)
+
+# ── 2. LR test pre ML normálne – základná NKPC ────────────────────────────────
+
+lr_ml_norm_basic <- 2 * (ll_value_ml_norm_basic - ll_value_ml_norm_basic_r)
+p_lr_ml_norm_basic <- pchisq(lr_ml_norm_basic, df = 1, lower.tail = FALSE)
+
+lr_ml_norm_basic_df <- data.frame(
+  Method = "ML (normálne)",
+  Model = "Základná NKPC",
+  Hypotéza = "H0: β = 1",
+  LR_stat = round(lr_ml_norm_basic, 4),
+  df = 1,
+  p_value = formatC(p_lr_ml_norm_basic, format = "e", digits = 4)
+)
+
+# ── 3. LR test pre ML t-rozdelenie – základná NKPC ──────────────────────────
+
+lr_ml_t_basic <- 2 * (ll_value_ml_t_basic - ll_value_ml_t_basic_r)
+p_lr_ml_t_basic <- pchisq(lr_ml_t_basic, df = 1, lower.tail = FALSE)
+
+lr_ml_t_basic_df <- data.frame(
+  Method = "ML (t-rozdelenie)",
+  Model = "Základná NKPC",
+  Hypotéza = "H0: β = 1",
+  LR_stat = round(lr_ml_t_basic, 4),
+  df = 1,
+  p_value = formatC(p_lr_ml_t_basic, format = "e", digits = 4)
+)
+
+# Kombinujem tabuľku
+lr_tests_basic <- rbind(lr_nls_basic_df, lr_ml_norm_basic_df, lr_ml_t_basic_df)
+
+knitr::kable(lr_tests_basic,
+             caption = "LR testy dlhodobej vertikality – základné modely (H0: β = 1)",
+             align = c("l", "l", "l", "r", "c", "r"))
+```
+
+### LR testy – hybridné modely
+
+```{r lr-tests-hybrid}
+# ── 4. LR test pre NLS – hybridná NKPC (H0: γ_f + γ_b = 1) ──────────────────
+
+rss_nls_hyb_unrestr <- rss_nls_hybrid
+rss_nls_hyb_restr <- rss_nls_hybrid_r
+
+lr_nls_hybrid <- n_nls_hybrid * (log(rss_nls_hyb_restr / n_nls_hybrid) - log(rss_nls_hyb_unrestr / n_nls_hybrid))
+p_lr_nls_hybrid <- pchisq(lr_nls_hybrid, df = 1, lower.tail = FALSE)
+
+lr_nls_hybrid_df <- data.frame(
+  Method = "NLS (normálne)",
+  Model = "Hybridná NKPC",
+  Hypotéza = "H0: γ_f + γ_b = 1",
+  LR_stat = round(lr_nls_hybrid, 4),
+  df = 1,
+  p_value = formatC(p_lr_nls_hybrid, format = "e", digits = 4)
+)
+
+# ── 5. LR test pre ML normálne – hybridná NKPC ────────────────────────────────
+
+lr_ml_norm_hybrid <- 2 * (ll_value_ml_norm_hybrid - ll_value_ml_norm_hybrid_r)
+p_lr_ml_norm_hybrid <- pchisq(lr_ml_norm_hybrid, df = 1, lower.tail = FALSE)
+
+lr_ml_norm_hybrid_df <- data.frame(
+  Method = "ML (normálne)",
+  Model = "Hybridná NKPC",
+  Hypotéza = "H0: γ_f + γ_b = 1",
+  LR_stat = round(lr_ml_norm_hybrid, 4),
+  df = 1,
+  p_value = formatC(p_lr_ml_norm_hybrid, format = "e", digits = 4)
+)
+
+# ── 6. LR test pre ML t-rozdelenie – hybridná NKPC ──────────────────────────
+
+lr_ml_t_hybrid <- 2 * (ll_value_ml_t_hybrid - ll_value_ml_t_hybrid_r)
+p_lr_ml_t_hybrid <- pchisq(lr_ml_t_hybrid, df = 1, lower.tail = FALSE)
+
+lr_ml_t_hybrid_df <- data.frame(
+  Method = "ML (t-rozdelenie)",
+  Model = "Hybridná NKPC",
+  Hypotéza = "H0: γ_f + γ_b = 1",
+  LR_stat = round(lr_ml_t_hybrid, 4),
+  df = 1,
+  p_value = formatC(p_lr_ml_t_hybrid, format = "e", digits = 4)
+)
+
+# Kombinujem tabuľku
+lr_tests_hybrid <- rbind(lr_nls_hybrid_df, lr_ml_norm_hybrid_df, lr_ml_t_hybrid_df)
+
+knitr::kable(lr_tests_hybrid,
+             caption = "LR testy dlhodobej vertikality – hybridné modely (H0: γ_f + γ_b = 1)",
+             align = c("l", "l", "l", "r", "c", "r"))
+```
+
+### Súhrná tabuľka všetkých LR testov
+
+```{r lr-tests-summary}
+# Kombinujem všetky LR testy
+lr_tests_all <- rbind(lr_tests_basic, lr_tests_hybrid)
+
+knitr::kable(lr_tests_all,
+             caption = "Kompletný prehľad LR testov dlhodobej vertikality",
+             align = c("l", "l", "l", "r", "c", "r"))
+
+```
+
+::: komentar
+**Interpretácia LR testov:**
+
+**Základné modely (H0: β = 1):**
+- NLS: LR = `r round(lr_nls_basic, 4)`, p-hodnota = `r formatC(p_lr_nls_basic, format = "e", digits = 4)`. Hypotézu zamietame.
+- ML (normálne): LR = `r round(lr_ml_norm_basic, 4)`, p-hodnota = `r formatC(p_lr_ml_norm_basic, format = "e", digits = 4)`. Hypotézu zamietame.
+- ML (t-rozdelenie): LR = `r round(lr_ml_t_basic, 4)`, p-hodnota = `r formatC(p_lr_ml_t_basic, format = "e", digits = 4)`. Hypotézu zamietame.
+
+**Hybridné modely (H0: γ_f + γ_b = 1):**
+- NLS: LR = `r round(lr_nls_hybrid, 4)`, p-hodnota = `r formatC(p_lr_nls_hybrid, format = "e", digits = 4)`. Hypotézu zamietame.
+- ML (normálne): LR = `r round(lr_ml_norm_hybrid, 4)`, p-hodnota = `r formatC(p_lr_ml_norm_hybrid, format = "e", digits = 4)`. Hypotézu zamietame.
+- ML (t-rozdelenie): LR = `r round(lr_ml_t_hybrid, 4)`, p-hodnota = `r formatC(p_lr_ml_t_hybrid, format = "e", digits = 4)`. Hypotézu zamietame.
+
+**Záver:** Všetky tri metódy (NLS, ML s normálnym rozdelením a ML s t-rozdelením) **konsistentne zamietajú** dlhodobú vertikalitu NKPC na veľmi nížkych hladinách významnosti. Výsledky sú v súlade s Waldovým testom z GMM (sekcia 2.3). T-rozdelenie poskytuje podobné p-hodnoty ako normálne rozdelenie, čo naznačuje, že extrémne pozorovaní nespôsobujú výrazné skreslenia.
+:::
+
+### Porovnanie odhadov GMM vs. NLS vs. ML
+
+```{r comparison-table}
+# Vytvoríme porovnávaciu tabuľku parametrov
+
+# Vyberieme si odhadnuté parametre z každej metódy
+comparison_df <- data.frame(
+  Metóda = c("GMM", "NLS", "ML (norm)", "ML (t)"),
+  lambda = c(
+    round(coef(Model_5)[1], 4),
+    round(coef(nls_hybrid)[1], 4),
+    round(coef(ml_norm_hybrid)[1], 4),
+    round(coef(ml_t_hybrid)[1], 4)
+  ),
+  gamma_f = c(
+    round(coef(Model_5)[2], 4),
+    round(coef(nls_hybrid)[2], 4),
+    round(coef(ml_norm_hybrid)[2], 4),
+    round(coef(ml_t_hybrid)[2], 4)
+  ),
+  gamma_b = c(
+    round(coef(Model_5)[3], 4),
+    round(coef(nls_hybrid)[3], 4),
+    round(coef(ml_norm_hybrid)[3], 4),
+    round(coef(ml_t_hybrid)[3], 4)
+  ),
+  sum_gf_gb = c(
+    round(coef(Model_5)[2] + coef(Model_5)[3], 4),
+    round(coef(nls_hybrid)[2] + coef(nls_hybrid)[3], 4),
+    round(coef(ml_norm_hybrid)[2] + coef(ml_norm_hybrid)[3], 4),
+    round(coef(ml_t_hybrid)[2] + coef(ml_t_hybrid)[3], 4)
+  )
+)
+
+knitr::kable(comparison_df,
+             col.names = c("Metóda", "$\\lambda$", "$\\gamma_f$", "$\\gamma_b$", "$\\gamma_f + \\gamma_b$"),
+             caption = "Porovnanie odhadov parametrov – hybridná NKPC",
+             align = c("l", "r", "r", "r", "r"))
+```
+
+::: komentar
+**Porovnanie odhadov naprieč metódami:**
+
+Všetky štyri metódy (GMM, NLS, ML s normálnym rozdelením a ML s t-rozdelením) poskytujú **veľmi podobné bodové odhady** parametrov λ, γ_f a γ_b, čo svedčí o stabilite odhadov.
+
+- **λ** (citlivosť na náklady): Všetky metódy dávajú hodnotu okolo 0,22–0,24, čo indikuje relatívne plochú Phillipsovu krivku.
+- **γ_f** (váha budúcej inflácie): Konzistentne okolo 0,88–0,90, čo znamená, že budúce inflačné očakávania majú vysokú váhu.
+- **γ_b** (váha minulej inflácie): Okolo 0,14–0,15, čo je nižšie ako γ_f.
+- **Suma γ_f + γ_b**: Všetky odhady sa pohybujú okolo 1,03–1,04, čo svedčí o **porušení dlhodobej vertikality** (suma > 1).
+
+**Efektivnosť:** GMM je asymptoticky efektivný pri správnej špecifikácii momentov. ML je efektivný, ak je rozdelenie správne špecifikované. NLS poskytuje konzistentné odhady, ale je menej efektívny. T-rozdelenie v ML odhadoch dáva podobné výsledky ako normálne rozdelenie, čo naznačuje, že údaje nemajú výrazné ťažké chvosty.
+:::
+
+
+# Záver
+
+```{r final-summary}
+summary_findings <- data.frame(
+  Aspekt = c(
+    "Dlhodobá vertikalita",
+    "Dominancia dopredu pozorujúcich chov.",
+    "Nominálna rigidita",
+    "Citlivosť na náklady",
+    "Stabilita modelov"
+  ),
+  Zistenie = c(
+    "ZAMIETNUTÁ na 1% hladine (γ_f + γ_b > 1)",
+    "POTVRDENÁ (γ_f ≈ 0,89 > γ_b ≈ 0,15)",
+    "STREDNÁ (θ ≈ 0,57, Calvo)",
+    "NÍZKA (λ ≈ 0,24)",
+    "VYSOKÁ (všetky metódy konzistentné)"
+  ),
+  Zdovodnenie = c(
+    "Všetky testy (Wald, LR, J) zamietajú β=1 a γ_f+γ_b=1",
+    "Inflačné očakávania sú hlavným motorom inflácie",
+    "Približne 57% firiem nemení ceny každé štvrťroky",
+    "Jednotkové náklady práce majú slabý bezprostredný dopad",
+    "GMM, NLS, ML dávajú rovnaké parametre"
+  )
+)
+
+knitr::kable(summary_findings,
+             col.names = c("Aspekt", "Zistenie", "Zdôvodnenie"),
+             caption = "Kľúčové zistenia o NKPC pre Francúzsko",
+             align = c("l", "l", "l"))
+```
+
+::: komentar
+**Záverečné zhrnutie:**
+
+Analýza novokeynesiánskej Phillipsovej krivky pre Francúzsko (2003Q2–2025Q1) odhalila:
+
+1. **Dlhodobá vertikalita NKPC nie je podporená:** Všetky testy (Waldov test z GMM, LR testy z NLS a ML) zamietajú hypotézu $\gamma_f + \gamma_b = 1$ s veľmi nízkymi p-hodnotami. Odhad $\gamma_f + \gamma_b \approx 1{,}04 > 1$ indikuje, že inflačný proces vo Francúzsku nie je čistý unit root. Centrálna banka môže dlhodobo vplývať na infláciu prostredníctvom dopytovej politiky.
+
+2. **Inflačné očakávania sú dominantné:** Vysoká váha $\gamma_f \approx 0{,}89$ znamená, že budúce inflačné očakávania majú rozhodujúci vplyv na súčasnú infláciu. Historické inflačné faktory majú slabú váhu ($\gamma_b \approx 0{,}15$). To potvrdzuje teóriu novokeynesiánizmu a podporuje cielenie inflačných očakávaní.
+
+3. **Nominálna rigidita je prítomná:** Calvo parameter $\theta \approx 0{,}57$ naznačuje, že zhruba 57 % francúzskych firiem nemení ceny v danom štvrťroku. Priemerná doba zmeny ceny je približne $1/(1-\theta) \approx 2{,}3$ štvrťroka, čo je rozumné pre priemyselnú ekonomiku.
+
+4. **Kľúčová úloha inflačných očakávaní pre ECB:** Vysoká elasticita na budúce inflácie ($\gamma_f$) znamená, že centrálna banka musí cielene riadiť inflačné očakávania. Kredibilita menovej politiky je kritická pre udržanie cenovej stability.
+
+5. **Robustnosť výsledkov:** GMM, NLS a ML odhady (s normálnym aj t-rozdelením) poskytujú konzistentné odhady parametrov, čo zvyšuje dôveru v závery. T-rozdelenie v ML dáva podobné výsledky ako normálne, čo naznačuje, že dáta nemajú výrazné ťažké chvosty.
+
+Tieto zistenia sú v súlade s pôvodnými závermi Galího a Gertlera (1999), ktoré zdôrazňujú dôležitosť dopredu pozerajúcich sa očakávaní v inflačnom procese.
+:::

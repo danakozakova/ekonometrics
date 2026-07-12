@@ -1,4 +1,4 @@
-# Determinanty urgentných návštev pri diabete 1. typu — LOGIT model 🩺
+# Determinanty urgentných návštev pri diabete 1. typu — LOGIT model
 
 > 🇬🇧 *Econometric analysis of factors driving emergency healthcare visits (severe hypoglycemia / DKA) among type-1 diabetes patients, using T1D Exchange registry data (USA, 2016, n = 2 454). Binary LOGIT model with collinearity diagnostics (VIF, BKW) and a probit comparison, built in gretl. **The data is not redistributable** — see Data access. Write-up in Slovak.*
 
@@ -26,7 +26,7 @@ Poznámka k interpretácii: vysoká „správnosť predikcie" (94 %) je do veľk
 
 Podrobný komentovaný výklad je v **[reporte (PDF)](Projekt_ekonometria.pdf)**.
 
-## Data access 🔐
+## Data access
 
 **Dáta nie sú súčasťou repozitára.** Pochádzajú z registra T1D Exchange a podliehajú jeho podmienkam použitia — prístup je individuálny a redistribúcia nie je povolená.
 

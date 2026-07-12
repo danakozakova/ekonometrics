@@ -1,0 +1,1541 @@
+---
+title: "Analýza modelu CAPM"
+author:
+- "Bc. P.-J. N."
+- Bc. V. K.
+- Bc. A. B.
+- Mgr. Dana Kozáková
+- (Skupina 02, Tím 07)
+date: "`r format(Sys.Date(), '%d. %m. %Y')`"
+output:
+  html_document:
+    number_sections: false
+    toc: true
+    toc_float: true
+    theme: flatly
+    highlight: tango
+    code_folding: show
+    code_download: true
+    df_print: paged
+  pdf_document:
+    toc: true
+lang: sk
+subtitle: Finančné trhy a investície
+---
+
+```{=html}
+<style>
+.komentar {
+  background-color: #f0f7ff;
+  border-left: 4px solid #2c7bb6;
+  padding: 10px;
+  margin: 10px 0;
+}
+</style>
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = FALSE,   # globálne: kód sa nezobrazuje
+  fig.height = 6,
+  fig.width  = 10,
+  message    = FALSE,
+  warning    = FALSE,
+  fig.align  = "center"
+)
+
+library(tidyverse)
+library(lubridate)
+library(quantmod)
+library(PerformanceAnalytics)
+library(broom)
+library(kableExtra)
+library(car)
+library(moments)
+```
+
+## Príklad 1: Získanie dát a odhady beta koeficientov
+
+### 1.1 Načítanie a príprava dát
+
+Využívame dataset obsahujúci denné ceny akcií komponentov indexu **S&P 500** za obdobie *február 2013 – február 2018 (5 rokov, 505 titulov)*. Keďže súbor neobsahuje bezrizikovú sadzbu, predpokladáme $r_f = 0$. Ako trhový index konštruujeme rovnako vážený priemer mesačných výnosov všetkých dostupných titulov.
+
+Mesačné výnosy počítame z cien na konci každého mesiaca (posledný obchodný deň) ako logaritmické výnosy: $$r_{j,t} = \ln\left(\frac{P_{j,t}}{P_{j,t-1}}\right)$$
+
+```{r data-loading}
+stocks_raw <- read_csv("all_stocks_5yr.csv",
+                       col_types = cols(date = col_date(format = "%Y-%m-%d")))
+
+full_stocks <- stocks_raw %>%
+  group_by(Name) %>%
+  filter(n() >= 1200) %>%
+  ungroup()
+
+n_titles   <- n_distinct(full_stocks$Name)
+datum_od    <- format(min(full_stocks$date), "%d. %m. %Y")
+datum_do    <- format(max(full_stocks$date), "%d. %m. %Y")
+n_excluded  <- n_distinct(stocks_raw$Name) - n_titles
+```
+
+```{r monthly-returns}
+monthly_prices <- full_stocks %>%
+  mutate(ym = floor_date(date, "month")) %>%
+  group_by(Name, ym) %>%
+  slice_max(date, n = 1) %>%
+  ungroup() %>%
+  select(Name, ym, close)
+
+monthly_returns <- monthly_prices %>%
+  arrange(Name, ym) %>%
+  group_by(Name) %>%
+  mutate(ret = log(close / lag(close))) %>%
+  filter(!is.na(ret)) %>%
+  ungroup()
+
+market_returns <- monthly_returns %>%
+  group_by(ym) %>%
+  summarise(rm = mean(ret, na.rm = TRUE), .groups = "drop")
+
+rf <- 0
+
+returns_data <- monthly_returns %>%
+  left_join(market_returns, by = "ym") %>%
+  mutate(
+    excess_j  = ret - rf,
+    excess_rm = rm  - rf
+  ) %>%
+  filter(!is.na(excess_rm))
+
+n_obs <- nrow(returns_data)
+```
+
+::: komentar
+- Dataset po filtrovaní obsahuje **`r n_titles` akciových titulov** s dennými cenami za obdobie `r datum_od` – `r datum_do` (≈ 60 mesiacov).
+- Vyradených bolo `r n_excluded` titulov s menej než 1 200 obchodnými dňami.
+- Celkový počet mesačných pozorovaní je **`r format(n_obs, big.mark = " ")`**.
+:::
+
+### 1.2 Vizualizácia trhového portfólia a výnosov
+
+```{r plot-market, fig.cap="Vývoj mesačného výnosu trhového portfólia"}
+market_returns %>%
+  ggplot(aes(x = ym, y = rm)) +
+  geom_line(color = "lightskyblue", linewidth = 0.8) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+  geom_ribbon(aes(ymin = pmin(rm, 0), ymax = 0), fill = "darkred",  alpha = 0.3) +
+  geom_ribbon(aes(ymin = 0, ymax = pmax(rm, 0)), fill = "darkblue", alpha = 0.3) +
+  scale_y_continuous(labels = scales::percent_format()) +
+  scale_x_date(date_breaks = "1 year", date_labels = "%Y") +
+  labs(
+    title    = "Mesačné výnosy trhového portfólia (S&P 500)",
+    subtitle = "02.2013 – 02.2018",
+    x = NULL, y = "Mesačný výnos (log)"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title    = element_text(hjust = 0.5, face = "bold"),
+    plot.subtitle = element_text(hjust = 0.5)
+  )
+```
+
+::: komentar
+Trhové portfólio vykazuje prevažne **kladné** mesačné výnosy, čo odráža dlhodobo rastúci trend amerického akciového trhu v sledovanom období.
+
+Výraznejšie poklesy sú viditeľné v auguste–septembri 2015 a začiatkom roka 2016, čo zodpovedá globálnemu výpredaju spojenému s pádom čínskeho akciového trhu a obavami o spomalenie čínskej ekonomiky.
+:::
+
+```{r plot-returns-summary}
+returns_summary <- monthly_returns %>%
+  group_by(Name) %>%
+  summarise(
+    Priemer   = mean(ret),
+    Medián    = median(ret),
+    SD        = sd(ret),
+    Min       = min(ret),
+    Max       = max(ret),
+    Šikmosť   = skewness(ret),
+    Špicatosť = kurtosis(ret),
+    .groups   = "drop"
+  ) %>%
+  arrange(desc(Priemer))
+
+bind_rows(
+  slice_head(returns_summary, n = 5),
+  slice_tail(returns_summary, n = 5)
+) %>%
+  mutate(across(where(is.numeric), ~ round(.x, 4))) %>%
+  knitr::kable(
+    caption = "Top 5 a Bottom 5 titulov podľa priemerného mesačného výnosu",
+    align   = c("l", rep("r", 7))
+  ) %>%
+  kable_styling(
+    bootstrap_options = c("striped", "hover"),
+    full_width        = TRUE,
+    font_size         = 13
+  ) %>%
+  row_spec(0,  bold = TRUE, background = "#2c7bb6", color = "white") %>%
+  row_spec(5, extra_css = "border-bottom: 2px solid #2c7bb6;")
+```
+
+::: komentar
+- Najvyššie priemerné mesačné výnosy dosahovali technologické tituly (**NVDA, NFLX, EA, AVGO**), ktoré v sledovanom období ťažili z nástupu cloudových služieb a digitálnej ekonomiky. Ale taktiež aj medicínska spoločnosť **ALGN**.
+- Naopak, najhoršie výsledky vykazovali energetické spoločnosti (**CHK, RRC, KMI**) postihnuté výrazným poklesom cien ropy v rokoch 2015–2016. Pokles postihol ale aj veľký streamovací koncern Discovery - tituly **DISCA** a **DISC**, či firmu Mattel (**MAT**).
+- Vysoká špicatosť niektorých titulov (napr. **DISCA** = 17.9, **KMI** = 14.5, **DISCK** = 17.8) naznačuje výskyt extrémnych výnosov, čo je v rozpore s predpokladom normálneho rozdelenia v CAPM.
+:::
+
+```{r plot-boxplot, fig.height=5, fig.cap="Distribúcia mesačných výnosov – náhodná vzorka 30 titulov"}
+set.seed(42)
+sample_stocks <- sample(unique(monthly_returns$Name), 30)
+
+monthly_returns %>%
+  filter(Name %in% sample_stocks) %>%
+  mutate(Name = fct_reorder(Name, ret, median)) %>%
+  ggplot(aes(x = Name, y = ret)) +
+  geom_boxplot(fill = "lightskyblue", alpha = 0.6, outlier.size = 0.8) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey") +
+  scale_y_continuous(labels = scales::percent_format()) +
+  labs(
+    title = "Distribúcia mesačných výnosov – vzorka 30 titulov",
+    x = NULL, y = "Mesačný výnos (log)"
+  ) +
+  theme_minimal(base_size = 10) +
+  theme(
+    plot.title    = element_text(hjust = 0.5, face = "bold"),
+    axis.text.x   = element_text(angle = 45, hjust = 1, size = 7)
+  )
+```
+
+::: komentar
+Väčšina titulov vykazuje mediánový výnos blízky nule s relatívne symetrickým rozložením, čo je konzistentné s predpokladmi CAPM. Viditeľné sú však výrazné odľahlé hodnoty u niektorých titulov, čo naznačuje občasné extrémne mesačné pohyby.
+:::
+
+```{r plot-rf, fig.width = 6, fig.asp = 0.5, out.width = "60%", fig.align = "center", eval=FALSE}
+# Bezriziková sadzba je predpokladaná nulová počas celého obdobia
+tibble(
+  ym = seq(min(market_returns$ym), max(market_returns$ym), by = "month"),
+  rf = 0
+) %>%
+  ggplot(aes(x = ym, y = rf)) +
+  geom_line(color = "darkblue", linewidth = 0.8, linetype = "dashed") +
+  scale_y_continuous(labels = scales::percent_format(), limits = c(-0.01, 0.01)) +
+  scale_x_date(date_breaks = "1 year", date_labels = "%Y") +
+  labs(
+    title    = "Bezriziková úroková miera (rf)",
+    subtitle = "Predpoklad: rf = 0 (02. 2013 – 02. 2018)",
+    x = NULL, y = "Mesačná sadzba"
+  ) +
+  theme_minimal(base_size = 10) + 
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    plot.subtitle = element_text(hjust = 0.5)
+  )
+
+```
+
+::: komentar
+Keďže dataset neobsahuje bezrizikovú úrokovú mieru, predpokladáme $r_f = 0$ počas celého sledovaného obdobia. Tento predpoklad zodpovedá prostrediu nízkych úrokových sadzieb po finančnej kríze 2008.
+:::
+
+### 1.3 Odhad beta koeficientov a charakteristické krivky
+
+Pre každý titul odhadneme OLS regresiou tzv. **charakteristickú krivku** CAPM: $$r_j - r_f = \alpha_j + \beta_j (r_m - r_f) + \varepsilon_j$$
+
+```{r estimate-betas}
+capm_models <- returns_data %>%
+  group_by(Name) %>%
+  nest() %>%
+  mutate(
+    model   = map(data, ~ lm(excess_j ~ excess_rm, data = .x)),
+    tidied  = map(model, broom::tidy),
+    glanced = map(model, broom::glance)
+  )
+
+capm_coefs <- capm_models %>%
+  select(Name, tidied) %>%
+  unnest(tidied) %>%
+  select(Name, term, estimate, std.error, statistic, p.value) %>%
+  pivot_wider(names_from  = term,
+              values_from = c(estimate, std.error, statistic, p.value)) %>%
+  rename(
+    alpha    = `estimate_(Intercept)`,
+    beta     = estimate_excess_rm,
+    se_alpha = `std.error_(Intercept)`,
+    se_beta  = std.error_excess_rm,
+    t_alpha  = `statistic_(Intercept)`,
+    t_beta   = statistic_excess_rm,
+    p_alpha  = `p.value_(Intercept)`,
+    p_beta   = p.value_excess_rm
+  )
+
+capm_fit <- capm_models %>%
+  select(Name, glanced) %>%
+  unnest(glanced) %>%
+  select(Name, r.squared)
+
+capm_results <- capm_coefs %>%
+  left_join(capm_fit, by = "Name") %>%
+  arrange(beta) %>% 
+  ungroup()
+
+beta_min      <- round(min(capm_results$beta), 3)
+beta_max      <- round(max(capm_results$beta), 3)
+n_defenzivne  <- sum(capm_results$beta < 1)
+n_agresivne   <- sum(capm_results$beta > 1)
+```
+
+::: komentar
+-   Beta koeficienty odhadnuté OLS metódou sa pohybujú v intervale **`r beta_min`** až **`r beta_max`**.
+-   V súbore je **`r n_defenzivne` defenzívnych titulov** ($\beta < 1$) a **`r n_agresivne` agresívnych titulov** ($\beta > 1$).
+-   Extrémne nízke hodnoty bety naznačujú tituly takmer nezávislé od pohybu trhu, zatiaľ čo hodnoty okolo 2.5–2.7 indikujú výrazne vyššiu volatilitu ako celý trh.
+:::
+
+```{r beta-table}
+bind_rows(
+  slice_head(capm_results, n = 5),
+  slice_tail(capm_results, n = 5)
+) %>%
+  transmute(
+    Titul       = Name,
+    Alpha       = round(alpha, 4),
+    Beta        = round(beta, 4),
+    `SE(Beta)`  = round(se_beta, 4),
+    `t(Beta)`   = round(t_beta, 3),
+    `R-squared` = round(r.squared, 3)
+  ) %>%
+  kbl(caption = "Top 5 (najvyššia β) a Bottom 5 (najnižšia β) titulov") %>%
+  kable_styling(
+    bootstrap_options = c("striped", "hover"),
+    full_width        = TRUE,
+    font_size         = 13
+  ) %>%
+  row_spec(0,  bold = TRUE, background = "#2c7bb6", color = "white") %>%
+  row_spec(5, extra_css = "border-bottom: 2px solid #2c7bb6;") %>%
+  scroll_box(height = "400px")
+```
+
+```{r characteristic-lines, fig.height=6, fig.width=10, fig.cap="Charakteristické krivky pre 6 defenzívnych a 6 agresívnych titulov"}
+selected <- c(
+  head(capm_results$Name, 6),
+  tail(capm_results$Name, 6)
+)
+
+returns_data %>%
+  filter(Name %in% selected) %>%
+  left_join(select(capm_results, Name, beta), by = "Name") %>%
+  mutate(
+    label = paste0(Name, " (β=", round(beta, 2), ")"),
+    typ   = ifelse(beta < 1, "Defenzívny (β < 1)", "Agresívny (β > 1)"),
+    label = fct_reorder(label, beta)
+  ) %>%
+  ggplot(aes(x = excess_rm, y = excess_j)) +
+  geom_point(alpha = 0.3, size = 0.7, color = "darkblue") +
+  geom_smooth(method = "lm", se = TRUE, color = "darkred",
+              fill = "darkred", alpha = 0.15, linewidth = 0.7) +
+  geom_hline(yintercept = 0, linetype = "dotted", color = "grey60") +
+  geom_vline(xintercept = 0, linetype = "dotted", color = "grey60") +
+  facet_wrap(~ label, ncol = 4, scales = "free") +
+  scale_x_continuous(labels = scales::percent_format()) +
+  scale_y_continuous(labels = scales::percent_format()) +
+  labs(
+    title    = "Charakteristické krivky CAPM – 6 defenzívnych a 6 agresívnych titulov",
+    subtitle = "Červená línia = OLS fit; tieňovaná oblasť = 95 % interval spoľahlivosti",
+    x        = "Trhová riziková prémia (rm − rf)",
+    y        = "Riziková prémia akcie (rj − rf)"
+  ) +
+  theme_minimal(base_size = 9) +
+  theme(
+    plot.title    = element_text(hjust = 0.5, face = "bold", size = 14),
+    plot.subtitle = element_text(hjust = 0.5, size = 11),
+    strip.text    = element_text(size = 7, face = "italic"),
+    panel.spacing = unit(1, "lines")
+  )
+```
+
+### 1.4 Test nulovosti konštanty $\alpha$ (hladina 5 %)
+
+Podľa CAPM by mala byť konštanta $\alpha_j$ štatisticky nevýznamná pre všetky tituly — výnos akcie by mal byť plne vysvetlený trhovým rizikom. Pre každý titul testujeme: $$H_0: \alpha_j = 0 \quad \text{vs} \quad H_1: \alpha_j \neq 0$$
+
+```{r alpha-test}
+alpha_test <- capm_results %>%
+  mutate(
+    reject_H0 = p_alpha < 0.05,
+    sig_label = ifelse(reject_H0, "Zamietame H₀", "Nezamietame H₀")
+  )
+
+n_rejected    <- sum(alpha_test$reject_H0)
+n_not_rejected  <- sum(!alpha_test$reject_H0)
+ratio_rejected     <- round(100 * n_rejected / nrow(alpha_test), 1)
+
+alpha_test %>%
+  group_by(sig_label) %>%
+  summarise(`Počet titulov` = n(), .groups = "drop") %>%
+  rename(`Výsledok` = sig_label) %>%
+  kbl(caption = "T-test na hladine 5 %") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE, font_size = 12)
+```
+
+```{r alpha-plot, fig.height=5}
+alpha_test %>%
+  arrange(p_alpha) %>%
+  mutate(rank = row_number()) %>%
+  ggplot(aes(x = rank, y = p_alpha, color = reject_H0)) +
+  geom_point(size = 1.2, alpha = 0.7) +
+  geom_hline(yintercept = 0.05, linetype = "dashed", color = "black") +
+  annotate("text", x = 5, y = 0.08, 
+           label = "α = 0.05",
+           hjust = 0, size = 3, fontface = "italic") +
+  scale_color_manual(
+    values = c("FALSE" = "darkblue", "TRUE" = "darkred")
+  ) +
+  scale_y_continuous(limits = c(0, 1)) +
+  labs(
+    title    = expression("p-hodnoty t-testu: " * H[0] * ": " * alpha == 0 * " pre každý titul"),
+    x        = "Poradie titulov (zoradené podľa p-hodnoty)",
+    y        = "p-hodnota",
+    color    = "Výsledok testu:"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    plot.title       = element_text(hjust = 0.5, face = "bold"),
+    plot.subtitle    = element_text(hjust = 0.5, size = 10),
+    legend.position  = "bottom",
+    panel.grid.minor = element_blank()
+  )
+```
+
+::: komentar
+-   Na hladine významnosti 5 % **nezamietame** $H_0: \alpha_j = 0$ pre **`r n_not_rejected` titulov** (`r 100 - ratio_rejected` %) — čo je v základnom súlade s predpokladmi CAPM.
+
+-   Pre zvyšných **`r n_rejected` titulov** (`r ratio_rejected` %) je $\alpha$ štatisticky významná, čo naznačuje, že tieto akcie prinášali nadpriemerné výnosy (tzv. **Jensenova $\alpha$**) nad rámec toho, čo predpovedá trhové riziko. Ide prevažne o tituly z technologického sektora, ktoré v období 2013–2018 výrazne prekonávali trh.
+:::
+
+------------------------------------------------------------------------
+
+## Příklad 2: Testování platnosti CAPM 
+
+### 2.1 Seřazení a vytvoření portfólii na základě $\beta$
+
+Cenné papíry seřadíme podle odhadované bety a rozdělíme je do **10 decilů** (portfolií). $\beta$ každého portfolia je aritmetický průměr individuálních $\beta$  jednotlivých cenných papírů v daném decilu. Výnosnost portfolia je průměrná $\alpha$ cenných papírů v daném decilu.
+
+```{r portfolia}
+ds_portfolio <- alpha_test %>%
+  ungroup() %>%
+  mutate(portfolio = ntile(beta, 10)) 
+
+portfolio_stats <- ds_portfolio %>%
+  group_by(portfolio) %>%
+  summarise(
+    Mean_Alpha    = mean(alpha, na.rm = TRUE),
+    Mean_Beta     = mean(beta,  na.rm = TRUE),
+    Mean_Sigma_Sq = mean(se_alpha^2, na.rm = TRUE),
+    Count         = n(),
+    .groups       = "drop"
+  )
+
+model_sml <- lm(Mean_Alpha ~ Mean_Beta, data = portfolio_stats)
+plot_alpha_beta <- ggplot(portfolio_stats, aes(x = Mean_Beta, y = Mean_Alpha)) +
+  geom_point(size = 5, color = "darkblue", alpha = 0.8) +
+  geom_text(aes(label = portfolio), 
+            vjust = -1.5,       
+            size = 5,           
+            fontface = "bold",   
+            color = "black") + 
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray50", size = 1) +
+  labs(
+    title = expression("Vztah průměrné " * beta * " a " * alpha * " napříč decily"),
+    subtitle = paste0("Počet portfólií: ", nrow(portfolio_stats)),
+    x = expression("Průměrná " * beta * " portfólia (riziko)"),
+    y = expression("Průměrná " * alpha * " portfólia (nadvýnos)")
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    plot.title    = element_text(hjust = 0.5, face = "bold", size = 18),
+    plot.subtitle = element_text(hjust = 0.5, color = "gray30"),
+    plot.caption  = element_text(hjust = 0.5),
+    axis.title    = element_text(face = "bold"),
+    plot.margin   = margin(20, 20, 20, 20, "pt")
+  ) +
+  scale_y_continuous(expand = expansion(mult = c(0.1, 0.2)))
+print(plot_alpha_beta)
+```
+
+### 2.2 Přidání security market line
+
+**Security Market Line (SML)** zachycuje teoretický lineární vztah mezi systematickým rizikem ($\beta$) a očekávaným nadvýnosem portfolia: $$r_{pi} - r_f = \gamma_0 + \gamma_1 \beta_{pi} + \varepsilon_{pi}$$
+
+Podle modelu CAPM by mělo platit: $\gamma_0 = 0$ a $\gamma_1 = \bar{r}_m - r_f$ (pozorovaná trhová prémie).
+
+```{r sml-modely, fig.height=6}
+portfolio_stats <- portfolio_stats %>%
+  mutate(Mean_Beta_Sq = Mean_Beta^2)
+
+# Základní SML model (test γ0 a γ1)
+model_sml <- lm(Mean_Alpha ~ Mean_Beta, data = portfolio_stats)
+
+# Rozšířený model pro test linearity (test γ2)
+model_linearita <- lm(Mean_Alpha ~ Mean_Beta + Mean_Beta_Sq, data = portfolio_stats)
+
+ggplot(portfolio_stats, aes(x = Mean_Beta, y = Mean_Alpha)) +
+  geom_smooth(method = "lm", color = "darkred", size = 1.2, se = TRUE) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray50", size = 1) +
+  geom_point(size = 8, color = "darkblue") +
+  geom_text(aes(label = portfolio), color = "white", fontface = "bold", size = 4) +
+  labs(
+    title = expression("Ekonometrický test SML (Security Market Line)"),
+    subtitle = expression("Testování parametrů " * gamma[0] * " (intercept) a " * gamma[1] * " (sklon)"),
+    x = expression("Průměrná " * beta * " portfólia (riziko)"),
+    y = expression("Průměrná " * alpha * " decilu (nadvýnos)")
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title    = element_text(hjust = 0.5, face = "bold", size = 16),
+    plot.subtitle = element_text(hjust = 0.5, color = "gray30"),
+    plot.caption  = element_text(hjust = 0.5),
+    axis.title    = element_text(face = "bold"),
+    plot.margin   = margin(30, 30, 110, 30, "pt")
+  )
+
+```
+
+### Statistické testy
+
+```{r model-objects}
+# výpočty, ktoré sa používajú v komentároch
+gamma0   <- round(coef(model_sml)[1], 5)
+gamma1   <- round(coef(model_sml)[2], 5)
+p_gamma0 <- round(summary(model_sml)$coefficients[1, 4], 5)
+p_gamma1 <- round(summary(model_sml)$coefficients[2, 4], 5)
+
+wt_gamma0 <- linearHypothesis(model_sml, "(Intercept) = 0")
+p_wald    <- round(wt_gamma0$`Pr(>F)`[2], 5)
+```
+
+
+#### **WALDŮV TEST** ($\gamma_0$ = 0)
+
+```{r test-Wald}
+linearHypothesis(model_sml, "(Intercept) = 0") %>%
+  kbl(caption = "Waldův test") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"),
+                full_width = FALSE, font_size = 12)
+
+```
+
+::: komentar
+Na základě Waldova testu zamítáme nulovou hypotézu, že $\gamma_0 = 0$ na hladině významnosti 5 %. Hodnota p-hodnoty je `r round(p_wald, 5)`. Podle teorie modelu CAPM by tento parametr měl být statisticky nevýznamný. Jeho významnost naznačuje, že model systematicky chybuje v ocenění nadvýnosu.
+:::
+
+#### **TEST LINEARITY** ($\gamma_2$ = 0): Je vztah lineární? (Významnost $\beta^2$)
+
+```{r test-lin}
+summary(model_linearita)$coefficients %>%
+  as.data.frame() %>%
+  rownames_to_column("Parameter") %>%
+  mutate(
+    Parameter = case_when(
+      Parameter == "(Intercept)" ~ "γ0 (intercept)",
+      Parameter == "Mean_Beta"   ~ "γ1 (sklon – beta)",
+      Parameter == "Mean_Beta_Sq"   ~ "γ₂ (kvadratický člen – beta^2)",
+      TRUE ~ Parameter
+    ),
+    across(where(is.numeric), ~ round(.x, 4))
+  ) %>%
+  kbl(caption = "Test linearity") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"),
+                full_width = FALSE, font_size = 12)
+
+```
+
+::: komentar
+Koeficient u $\beta^2$ je statisticky významný (p = 0.0030), proto zamítáme nulovou hypotézu o linearitě. To naznačuje, že vztah mezi výnosem a betou není lineární a SML model je pravděpodobně špatně specifikován.
+:::
+
+::: komentar
+**Test sklonu parametru** $\gamma_1$: Odhadnutá hodnota $`r gamma1`$ vykazuje záporný sklon SML, což je v rozporu s předpokladem CAPM, kde by $\gamma_1$ měla odpovídat kladné tržní rizikové prémii. Tento výsledek naznačuje, že vztah mezi výnosem a systematickým rizikem není v souladu s teoretickým očekáváním CAPM.
+:::
+
+::: komentar
+V období 2013-2018 model CAPM na zkoumaném vzorku selhává. Pozorujeme tzv. Low-Beta anomálii, kdy bezečnější tituly překonaly očekávání a rizikové tituly zaostaly.
+:::
+
+```{r sml-tabulka}
+summary(model_sml)$coefficients %>%
+  as.data.frame() %>%
+  rownames_to_column("Parameter") %>%
+  mutate(
+    Parameter = case_when(
+      Parameter == "(Intercept)" ~ "γ₀ (intercept)",
+      Parameter == "Mean_Beta"   ~ "γ₁ (sklon – beta)",
+      TRUE ~ Parameter
+    ),
+    across(where(is.numeric), ~ round(.x, 4))
+  ) %>%
+  kbl(
+    caption = "Koeficienty základního SML modelu"
+  ) %>%
+  kable_styling(
+    bootstrap_options = c("striped", "hover"),
+    full_width = FALSE,
+    font_size = 12
+  )
+```
+
+
+### 2.3 Test CAPM podle Fama a MacBeth 
+
+Kromě základní specifikace SML testujeme také rozšířenou specifikaci:
+
+$$
+r_j = \delta_1 + \delta_2 \beta_j + \delta_3 \beta_j^2 + \delta_4 \sigma^2_{\varepsilon_j} + \varepsilon_j
+$$
+
+Podle modelu CAPM by mělo platit:
+- $\delta_3 = 0$ (linearita)
+- $\delta_4 = 0$ (nesystematické riziko nemá vliv)
+- $\delta_2 > 0$ (kladná riziková prémie)
+
+
+```{r}
+portfolio_fm_data <- ds_portfolio %>%
+  group_by(portfolio) %>%
+  summarise(
+    Mean_Return = mean(alpha, na.rm = TRUE),
+    Mean_Beta = mean(beta, na.rm = TRUE),
+    Mean_Beta_Sq = mean(beta^2, na.rm = TRUE),
+    Mean_Sigma_Sq = mean(se_alpha^2, na.rm = TRUE) 
+  )
+
+model_fama_macbeth <- lm(
+  Mean_Return ~ Mean_Beta + Mean_Beta_Sq + Mean_Sigma_Sq,
+  data = portfolio_fm_data
+)
+
+fm_coefs <- summary(model_fama_macbeth)$coefficients
+p_delta3 <- round(fm_coefs["Mean_Beta_Sq",  "Pr(>|t|)"], 4)
+p_delta4 <- round(fm_coefs["Mean_Sigma_Sq", "Pr(>|t|)"], 4)
+wald_fm   <- linearHypothesis(model_fama_macbeth,
+                             c("Mean_Beta_Sq = 0", "Mean_Sigma_Sq = 0"))
+p_wald_fm <- round(wald_fm$`Pr(>F)`[2], 4)
+```
+
+
+```{r}
+summary_results <- summary(model_fama_macbeth)
+summary_results$coefficients %>%
+  as.data.frame() %>%
+  rownames_to_column("Parameter") %>%
+  mutate(
+    Parameter = case_when(
+      Parameter == "(Intercept)"   ~ "δ1 (intercept)",
+      Parameter == "Mean_Beta"     ~ "δ2 (beta)",
+      Parameter == "Mean_Beta_Sq"  ~ "δ3 (beta^2)",
+      Parameter == "Mean_Sigma_Sq" ~ "δ4 (σ^2)",
+      TRUE ~ Parameter
+    ),
+    across(where(is.numeric), ~ round(.x, 4))
+  ) %>%
+  kbl(caption = "VÝSLEDKY TESTU FAMA-MACBETH") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"),
+                full_width = FALSE, font_size = 12)
+
+linearHypothesis(model_fama_macbeth, c("Mean_Beta_Sq = 0", "Mean_Sigma_Sq = 0")) %>%
+  as.data.frame() %>%
+  mutate(
+    across(where(is.numeric), ~ round(.x, 4))
+  ) %>%
+  kbl(caption = "WALDŮV TEST PRO SPOLEČNOU NULOVOU HYPOTÉZU (δ3 = δ4 = 0)") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"),
+                full_width = FALSE, font_size = 12)
+```
+
+```{r fama-macbeth, fig.height=6}
+ggplot(portfolio_stats, aes(x = Mean_Beta, y = Mean_Alpha)) +
+  geom_point(size = 9) +
+  geom_text(aes(label = portfolio), color = "white", fontface = "bold", size = 4) +
+  geom_smooth(method = "lm", formula = y ~ x, se = FALSE, linetype = "dashed") +
+  geom_smooth(method = "lm", formula = y ~ x + I(x^2), se = TRUE, alpha = 0.2) +
+  geom_hline(yintercept = 0, linetype = "dotted") +
+  labs(
+    title = "Test linearity a specifikace Fama–MacBeth",
+    subtitle = "Lineární vs. kvadratický vztah mezi β a výnosem",
+    x = expression(paste("Systematické riziko (", beta, ")")),
+    y = expression(paste("Nadvýnos (", alpha, ")"))
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold", size = 16, hjust = 0.5),
+    plot.subtitle = element_text(hjust = 0.5),
+    plot.caption = element_text(hjust = 0.5),
+    axis.title.x = element_text(hjust = 0.5),
+    axis.title.y = element_text(hjust = 0.5),
+    plot.margin = margin(20, 20, 20, 20)
+  )
+```
+
+::: komentar
+1. **Linearita a nesystematické riziko:** Individuální testy ukazují, že koeficienty $\delta_3$ ($p = `r p_delta3`$) a $\delta_4$ ($p = `r p_delta4`$) nejsou statisticky významné. To znamená, že samostatně nelze prokázat vliv kvadratického členu ani reziduálního rizika na výnosy.
+
+2. **Společný Waldův test:** Společný test nulovosti $\delta_3$ a $\delta_4$ zamítá nulovou hypotézu ($p = `r p_wald_fm`$), což naznačuje, že model jako celek vykazuje odchylky od CAPM.
+
+3. **Systematické riziko:** Koeficient $\delta_2$ je statisticky významný, což potvrzuje, že $\beta$ zůstává klíčovým determinantem výnosu.
+:::
+
+::: komentar
+**Závěr:** Výsledky ukazují, že zatímco individuální nelineární efekty nejsou jednoznačně významné, společný test naznačuje odchylku od teoretické specifikace CAPM. Model tedy není plně konzistentní s předpoklady lineární SML.
+:::
+
+## Príklad 3: Štrukturálne zlomy v CAPM
+
+Testujeme, či sa $\beta$ koeficient zmenil v **posledných 24 mesiacoch** vzorky. \ Charakteristickú krivku rozšírime o interakčný člen so slope dummy $D_t$: $$r_j - r_f = \alpha_j + \beta_j(r_m - r_f) + \delta_j \cdot D_t \cdot (r_m - r_f) + \varepsilon_j$$ \
+
+* kde $D_t = 1$ pre posledných 24 mesiacov, inak $D_t = 0$. \
+* Ak je $\delta_j$ štatisticky významné, $\beta$ sa zmenila.
+
+Na testovanie použijeme 2 testy:
+
+-   **Chowov test štrukturálneho zlomu**
+-   **Chowov predpovedný test**
+
+### 3.1a Test štrukturálneho zlomu v $\beta$ koeficientoch
+
+**Chowov test štrukturálneho zlomu** rozdelí vzorku v bode zlomu na dve časti a porovná reziduálne súčty štvorcov spojeného modelu ($S_0$) s reziduálnymi súčtami štvorcov dvoch samostatných modelov ($S_1$, $S_2$). \
+
+* F-štatistika má tvar: $$F = \frac{(S_0 - S_1 - S_2)/k}{(S_1 + S_2)/(n_1 + n_2 - 2k)} \sim F(k,\ n_1 + n_2 - 2k)$$ \
+* $H_0: \beta_j^{(1)} = \beta_j^{(2)}$
+
+```{r chow-setup}
+library(strucchange)
+
+breakpoint <- max(returns_data$ym) %m-% months(23)
+
+returns_data <- returns_data %>%
+  mutate(D = as.integer(ym >= breakpoint))
+
+n_before <- returns_data %>% filter(D == 0) %>% distinct(ym) %>% nrow()
+n_after  <- returns_data %>% filter(D == 1) %>% distinct(ym) %>% nrow()
+```
+
+Bod zlomu je `r format(breakpoint, "%m. %Y")`, čím vznikajú dve obdobia: $`r n_before`$ mesiacov (pred zlomom) a $`r n_after`$ mesiacov (po zlome).
+
+```{r chow-test}
+
+chow_results <- returns_data %>%
+  group_by(Name) %>%
+  nest() %>%
+  mutate(
+    bp_index    = map_int(data, ~ which(.x$ym == breakpoint)[1]),
+    chow        = map2(data, bp_index,
+                    ~ sctest(excess_j ~ excess_rm,
+                             type  = "Chow",
+                             point = .y,
+                             data  = .x)),
+    p_chow      = map_dbl(chow, ~ .x$p.value),
+    sig_chow    = p_chow < 0.05
+  ) %>%
+  select(Name, bp_index, p_chow, sig_chow) %>%
+  arrange(p_chow) %>%
+  ungroup()
+
+n_sig_chow <- sum(chow_results$sig_chow)
+```
+
+```{r chow-table}
+chow_results %>%
+  mutate(sig_label = ifelse(sig_chow, "Zamietame H₀", "Nezamietame H₀")) %>%
+  group_by(sig_label) %>%
+  summarise(`Počet titulov` = n(), .groups = "drop") %>%
+  rename(`Výsledok` = sig_label) %>%
+  kbl(caption = "Chowov test štrukturálneho zlomu na hladine 5 %") %>%
+  kable_styling(
+    bootstrap_options = c("striped", "hover"),
+    full_width        = FALSE,
+    font_size         = 13
+  ) %>%
+  row_spec(0, bold = TRUE, background = "#2c7bb6", color = "white")
+```
+
+```{r chow-graf, fig.height=5}
+
+chow_results %>%
+  arrange(p_chow) %>%
+  mutate(rank = row_number()) %>%
+  ggplot(aes(x = rank, y = p_chow, color = sig_chow)) +
+  geom_point(size = 1.2, alpha = 0.7) +
+  geom_hline(yintercept = 0.05, linetype = "dashed", color = "black") +
+  annotate("text", x = 5, y = 0.08, label = "alpha = 0.05",
+           hjust = 0, size = 3, fontface = "italic") +
+  scale_color_manual(
+  values = c("FALSE" = "darkblue", "TRUE" = "darkred")
+) +
+  scale_y_continuous(limits = c(0, 1)) +
+  labs(
+    title    = "Chow break test:  p - hodnoty pre tituly",
+    subtitle = "Bod zlomu: posledných 24 mesiacov vzorky",
+    x        = "Poradie titulov (zoradené podľa p-hodnoty)",
+    y        = "p-hodnota"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    plot.title       = element_text(hjust = 0.5, face = "bold"),
+    plot.subtitle    = element_text(hjust = 0.5, size = 10),
+    panel.grid.minor = element_blank()
+  )
+```
+
+::: komentar
+Na hladine významnosti 5 % zamietame stabilitu $\beta$ koeficientu u **`r n_sig_chow` titulov** (`r round(100 * n_sig_chow / nrow(chow_results), 1)` % zo všetkých `r nrow(chow_results)` titulov). Pre výraznú väčšinu akcií teda nemáme štatistický dôkaz o štrukturálnom zlome v $\beta$ v posledných 24 mesiacoch vzorky. Tituly so zisteným zlomom pochádzajú z rôznych sektorov – od maloobchodu (ORLY, AZO, TSCO) cez zdravotníctvo (CAH, MCK, CVS) až po technológie (NVDA, MA, FISV), čo naznačuje skôr sektorovo špecifické zmeny ako systematický trhový jav.
+:::
+
+### 3.1b Chowov predpovedný test
+
+**Chowov predpovedný test** odhaduje model len na prvom období a meria, ako dobre predpovedá druhé obdobie. F-štatistika má tvar:
+
+$$F = \frac{(S_0 - S_1)/n_2}{S_1/(n_1 - k)} \sim F(n_2,\ n_1 - k)$$
+
+kde $S_0$ je RSS z modelu odhadnutého na celej vzorke, $S_1$ je RSS z modelu odhadnutého len na prvom období, $n_1$, $n_2$ sú počty pozorovaní pred a po zlome a $k$ je počet parametrov modelu.
+
+```{r chow-pred}
+breakpoint <- max(returns_data$ym) %m-% months(23)
+
+pred_results <- returns_data %>%
+  group_by(Name) %>%
+  nest() %>%
+  mutate(
+    # RSS z celej vzorky (S0)
+    model_full  = map(data, ~ lm(excess_j ~ excess_rm, data = .x)),
+    S0          = map_dbl(model_full, ~ sum(residuals(.x)^2)),
+
+    # RSS len z prvého obdobia (S1)
+    model_pred  = map(data, ~ lm(excess_j ~ excess_rm,
+                                 data = filter(.x, ym < breakpoint))),
+    S1          = map_dbl(model_pred, ~ sum(residuals(.x)^2)),
+
+    # n1, n2, k
+    n1          = map_int(data, ~ sum(.x$ym <  breakpoint)),
+    n2          = map_int(data, ~ sum(.x$ym >= breakpoint)),
+    k           = 2L,
+
+    # F-statistika a p-hodnota
+    F_stat      = ((S0 - S1) / n2) / (S1 / (n1 - k)),
+    p_pred      = pf(F_stat, df1 = n2, df2 = n1 - k, lower.tail = FALSE),
+    sig_pred    = p_pred < 0.05
+  ) %>%
+  select(Name, F_stat, p_pred, sig_pred) %>%
+  ungroup() %>%
+  arrange(p_pred)
+
+n_sig_pred <- sum(pred_results$sig_pred)
+```
+
+```{r pred-table}
+pred_results %>%
+  mutate(sig_label = ifelse(sig_pred, "Zamietame H0", "Nezamietame H0")) %>%
+  group_by(sig_label) %>%
+  summarise(`Počet titulov` = n(), .groups = "drop") %>%
+  rename(`Záver testu` = sig_label) %>%
+  kbl(caption = "Chowov predpovedného testu na hladine 5 %") %>%
+  kable_styling(
+    bootstrap_options = c("striped", "hover"),
+    full_width        = FALSE,
+    font_size         = 13
+  ) %>%
+  row_spec(0, bold = TRUE, background = "#2c7bb6", color = "white")
+```
+
+```{r pred-graf, fig.height=5}
+pred_results %>%
+  arrange(p_pred) %>%
+  mutate(rank = row_number()) %>%
+  ggplot(aes(x = rank, y = p_pred, color = sig_pred)) +
+  geom_point(size = 1.2, alpha = 0.7) +
+  geom_hline(yintercept = 0.05, linetype = "dashed", color = "black") +
+  annotate("text", x = 5, y = 0.08, label = "alpha = 0.05",
+           hjust = 0, size = 3, fontface = "italic") +
+  scale_color_manual(
+    values = c("FALSE" = "darkblue", "TRUE" = "darkred")
+  ) +
+  scale_y_continuous(limits = c(0, 1)) +
+  labs(
+    title    = "Chowov predpovedný test:  p - hodnoty pre každú akciu",
+    subtitle = "Bod zlomu: posledných 24 mesiacov vzorky",
+    x        = "Poradie titulov (zoradené podľa p-hodnoty)",
+    y        = "p-hodnota",
+    color    = "Výsledok testu:"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    plot.title       = element_text(hjust = 0.5, face = "bold"),
+    plot.subtitle    = element_text(hjust = 0.5, size = 10),
+    panel.grid.minor = element_blank()
+  )
+```
+
+::: komentar
+Chowov predpovedný test zamietol stabilitu modelu u **`r n_sig_pred` titulov** (`r round(100 * n_sig_pred / nrow(pred_results), 1)` %), čo je výrazne viac ako pri štrukturálnom teste (`r n_sig_chow` titulov). Rozdiel medzi testami: štrukturálny test testuje len zmenu koeficientov, predpovedný test je citlivejší – zamietne aj keď sa zmení rozptyl reziduálov alebo iná charakteristika modelu. Vyšší počet zamietnutí pri predpovednom teste teda naznačuje, že pre mnohé tituly sa síce $\beta$ štatisticky nezmenila, ale model z prvého obdobia predpovedá druhé obdobie so systematickou chybou.
+:::
+
+### 3.2 Platnost CAPM modelu (security market line) na dvoch obdobiach 
+
+```{r sml-obdobia-setup}
+# Rozdelenie dát na dve obdobia
+returns_before <- returns_data %>% filter(ym <  breakpoint)
+returns_after  <- returns_data %>% filter(ym >= breakpoint)
+```
+
+```{r sml-obdobia-bety}
+# Funkcia na odhad biet – rovnaký postup ako v Príklade 1
+estimate_betas <- function(data) {
+  data %>%
+    group_by(Name) %>%
+    nest() %>%
+    mutate(
+      model  = map(data, ~ lm(excess_j ~ excess_rm, data = .x)),
+      tidied = map(model, broom::tidy)
+    ) %>%
+    select(Name, tidied) %>%
+    unnest(tidied) %>%
+    select(Name, term, estimate) %>%
+    pivot_wider(names_from = term, values_from = estimate) %>%
+    rename(
+      alpha = `(Intercept)`,
+      beta  = excess_rm
+    ) %>%
+    ungroup()
+}
+
+betas_before <- estimate_betas(returns_before)
+betas_after  <- estimate_betas(returns_after)
+```
+
+```{r sml-obdobia-portfolia}
+# Funkcia na tvorbu portfólií a odhad SML – rovnaký postup ako v Príklade 2
+estimate_sml <- function(betas) {
+  betas %>%
+    mutate(portfolio = ntile(beta, 10)) %>%
+    group_by(portfolio) %>%
+    summarise(
+      Mean_Excess_Return = mean(alpha, na.rm = TRUE),
+      Mean_Beta          = mean(beta,  na.rm = TRUE),
+      .groups            = "drop"
+    ) %>%
+    lm(Mean_Excess_Return ~ Mean_Beta, data = .)
+}
+
+sml_before <- estimate_sml(betas_before)
+sml_after  <- estimate_sml(betas_after)
+
+# Koeficienty
+g0_before <- round(coef(sml_before)[1], 5)
+g1_before <- round(coef(sml_before)[2], 5)
+g0_after  <- round(coef(sml_after)[1],  5)
+g1_after  <- round(coef(sml_after)[2],  5)
+
+p_g0_before <- round(summary(sml_before)$coefficients[1, 4], 4)
+p_g1_before <- round(summary(sml_before)$coefficients[2, 4], 4)
+p_g0_after  <- round(summary(sml_after)$coefficients[1,  4], 4)
+p_g1_after  <- round(summary(sml_after)$coefficients[2,  4], 4)
+```
+
+```{r sml-obdobia-graf, fig.height=6}
+# Pripravíme body portfólií pre oba grafy
+portfolia_before <- betas_before %>%
+  mutate(portfolio = ntile(beta, 10)) %>%
+  group_by(portfolio) %>%
+  summarise(
+    Mean_Excess_Return = mean(alpha, na.rm = TRUE),
+    Mean_Beta          = mean(beta,  na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(obdobie = "1 Pred zlomom")
+
+portfolia_after <- betas_after %>%
+  mutate(portfolio = ntile(beta, 10)) %>%
+  group_by(portfolio) %>%
+  summarise(
+    Mean_Excess_Return = mean(alpha, na.rm = TRUE),
+    Mean_Beta          = mean(beta,  na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(obdobie = "2 Po zlome")
+
+bind_rows(portfolia_before, portfolia_after) %>%
+  ggplot(aes(x = Mean_Beta, y = Mean_Excess_Return)) +
+  geom_smooth(method = "lm", color = "darkred", linewidth = 1.2,
+              se = TRUE) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray50",
+             linewidth = 1) +
+  geom_point(size = 8, color = "darkblue") +
+  geom_text(aes(label = portfolio), color = "white",
+            fontface = "bold", size = 4) +
+  facet_wrap(~ obdobie) +
+  labs(
+    title    = "Security Market Line – pred zlomom vs. po zlome",
+    subtitle = paste0("Bod zlomu: ", format(breakpoint, "%m. %Y")),
+    x        = "Priemerná beta portfólia",
+    y        = "Priemerné prevýšenie výnosu portfólia"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title    = element_text(face = "bold", size = 16),
+    plot.subtitle = element_text(hjust = 0.5),
+    axis.title    = element_text(face = "bold")
+  )
+```
+
+```{r sml-obdobia-tabulka}
+bind_rows(
+  summary(sml_before)$coefficients %>%
+    as.data.frame() %>%
+    rownames_to_column("Parameter") %>%
+    mutate(Obdobie = "Pred zlomom"),
+  summary(sml_after)$coefficients %>%
+    as.data.frame() %>%
+    rownames_to_column("Parameter") %>%
+    mutate(Obdobie = "Po zlome")
+) %>%
+  mutate(
+    Parameter = case_when(
+      Parameter == "(Intercept)" ~ "γ₀ (intercept)",
+      Parameter == "Mean_Beta"   ~ "γ₁ (sklon – beta)",
+      TRUE ~ Parameter
+    ),
+    across(where(is.numeric), ~ round(.x, 4))
+  ) %>%
+  select(Obdobie, Parameter, everything()) %>%
+  kbl(caption = "Koeficienty SML pre dve obdobia") %>%
+  kable_styling(
+    bootstrap_options = c("striped", "hover"),
+    full_width        = TRUE,
+    font_size         = 13
+  ) %>%
+  row_spec(0, bold = TRUE, background = "#2c7bb6", color = "white") %>%
+  row_spec(2, extra_css = "border-bottom: 2px solid #2c7bb6;")
+```
+
+::: komentar
+SML vykazuje v **oboch obdobiach negatívny sklon**, čo potvrdzuje záver z Príkladu 2 o prítomnosti Low-Beta anomálie počas celého sledovaného obdobia.
+
+**Pred zlomom** (02.2013 – 02.2016): $\hat{\gamma}_0 = `r g0_before`$ ($p = `r p_g0_before`$), $\hat{\gamma}_1 = `r g1_before`$ ($p = `r p_g1_before`$) – oba koeficienty štatisticky významné.
+
+**Po zlome** (03.2016 – 02.2018): $\hat{\gamma}_0 = `r g0_after`$ ($p = `r p_g0_after`$), $\hat{\gamma}_1 = `r g1_after`$ ($p = `r p_g1_after`$) – oba koeficienty štatisticky významné.
+
+Hodnoty $\gamma_0$ a $\gamma_1$ sú v oboch obdobiach veľmi podobné, čo naznačuje, že anomália nie je sústredená len v jednej perióde, ale ide o systematický jav. CAPM teda zlyháva konzistentne v celom sledovanom období 2013–2018.
+:::
+
+### 3.3 Asymetria beta koeficientu (dual-beta model)
+
+Štandardný CAPM predpokladá, že beta koeficient je rovnaký bez ohľadu na smer pohybu trhu. Testujeme, či akcie reagujú inak pri **raste** ($r_{m,t} - r_f > 0$) a inak pri **poklese** trhu ($r_{m,t} - r_f \leq 0$). Charakteristickú krivku reformulujeme zavedením indikátorovej premennej:
+
+$$D_t^{-} = \begin{cases} 1 & \text{ak } r_{m,t} - r_f \leq 0 \\ 0 & \text{inak} \end{cases}$$
+
+**Dual-beta model (testovacia forma):** $$r_{j,t} - r_f = \alpha_j + \beta_j^{+}(r_{m,t} - r_f) + \gamma_j \cdot D_t^{-}(r_{m,t} - r_f) + \varepsilon_{j,t}$$
+
+kde $\beta_j^{+}$ je $\beta$ pri raste trhu a $\beta_j^{-} = \beta_j^{+} + \gamma_j$ je $\beta$ pri poklese trhu. Test asymetrie sa tak redukuje na: $$H_0: \gamma_j = 0 \quad \text{(}\beta^+ = \beta^-\text{, symetria)}\quad \text{vs} \quad H_1: \gamma_j \neq 0$$
+
+```{r dual-beta-setup}
+# ── 1. Konštrukcia indikátorovej premennej a interakcií ───────────────────────
+returns_data <- returns_data %>%
+  mutate(
+    D_minus  = as.integer(excess_rm <= 0),        # bear: rm-rf ≤ 0
+    D_plus   = 1L - D_minus,                       # bull: rm-rf > 0
+    mkt_up   = D_plus  * excess_rm,                # interakcia: kladná prémia
+    mkt_down = D_minus * excess_rm                 # interakcia: záporná prémia
+  )
+
+n_bull <- returns_data %>% distinct(ym, D_plus)  %>% filter(D_plus  == 1) %>% nrow()
+n_bear <- returns_data %>% distinct(ym, D_minus) %>% filter(D_minus == 1) %>% nrow()
+```
+
+::: komentar
+Z celkových \~60 mesiacov sledovaného obdobia bolo **`r n_bull` bull mesiacov** ($r_m - r_f > 0$) a **`r n_bear` bear mesiacov** ($r_m - r_f \leq 0$). Sledované obdobie 2013–2018 bolo prevažne rastúcim trhom, čo znižuje štatistickú silu pre odhad $\beta^-$ — tento fakt je nutné zohľadniť pri interpretácii výsledkov.
+:::
+
+```{r dual-beta-estimation}
+# ── 2. Odhad dual-beta modelu pre každý titul (Forma B – testovacia) ─────────
+dual_beta_models <- returns_data %>%
+  group_by(Name) %>%
+  nest() %>%
+  mutate(
+    # Forma B: r_j = alpha + beta_plus*(rm-rf) + gamma*D_minus*(rm-rf) + e
+    model_B   = map(data, ~ lm(excess_j ~ excess_rm + mkt_down, data = .x)),
+    # Forma A: r_j = alpha + beta_plus*mkt_up + beta_minus*mkt_down + e
+    model_A   = map(data, ~ lm(excess_j ~ mkt_up + mkt_down, data = .x)),
+    tidy_B    = map(model_B, broom::tidy),
+    tidy_A    = map(model_A, broom::tidy),
+    glanced_B = map(model_B, broom::glance)
+  )
+
+# Extrakcia koeficientov z Formy B (pre test gamma)
+coefs_B <- dual_beta_models %>%
+  select(Name, tidy_B) %>%
+  unnest(tidy_B) %>%
+  select(Name, term, estimate, std.error, statistic, p.value) %>%
+  pivot_wider(names_from  = term,
+              values_from = c(estimate, std.error, statistic, p.value)) %>%
+  rename(
+    alpha       = `estimate_(Intercept)`,
+    beta_plus   = estimate_excess_rm,
+    gamma       = estimate_mkt_down,
+    se_gamma    = std.error_mkt_down,
+    t_gamma     = statistic_mkt_down,
+    p_gamma     = p.value_mkt_down
+  )
+
+# Extrakcia beta_minus z Formy A
+coefs_A <- dual_beta_models %>%
+  select(Name, tidy_A) %>%
+  unnest(tidy_A) %>%
+  filter(term == "mkt_down") %>%
+  select(Name, beta_minus = estimate)
+
+# R² z Formy B
+r2_B <- dual_beta_models %>%
+  select(Name, glanced_B) %>%
+  unnest(glanced_B) %>%
+  select(Name, r2 = r.squared)
+
+# Spojenie výsledkov
+dual_results <- coefs_B %>%
+  left_join(coefs_A, by = "Name") %>%
+  left_join(r2_B,    by = "Name") %>%
+  mutate(
+    beta_diff  = beta_minus - beta_plus,
+    reject_H0  = p_gamma < 0.05,
+    sig_label  = ifelse(reject_H0, "Zamietame H₀", "Nezamietame H₀")
+  ) %>%
+  ungroup()
+
+# Súhrnné počty
+n_asymetria  <- sum(dual_results$reject_H0)
+n_symetria   <- sum(!dual_results$reject_H0)
+n_total_dual <- nrow(dual_results)
+pct_asym     <- round(100 * n_asymetria / n_total_dual, 1)
+pct_sym      <- round(100 * n_symetria  / n_total_dual, 1)
+```
+
+```{r dual-beta-summary-table}
+# ── 3. Súhrnná tabuľka výsledkov testu ────────────────────────────────────────
+dual_results %>%
+  group_by(sig_label) %>%
+  summarise(`Počet titulov` = n(), .groups = "drop") %>%
+  mutate(`Podiel (%)` = round(100 * `Počet titulov` / n_total_dual, 1)) %>%
+  rename(`Záver testu` = sig_label) %>%
+  kbl(caption = "Výsledky testu H₀: γⱼ = 0 (β⁺ = β⁻) na hladine 5 %") %>%
+  kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed"),
+    full_width        = FALSE,
+    font_size         = 13
+  ) %>%
+  row_spec(0, bold = TRUE, background = "#2c7bb6", color = "white")
+```
+
+```{r dual-beta-top-table}
+# ── 4. Top 10 titulov s najvýraznejšou asymetriou ─────────────────────────────
+dual_results %>%
+  filter(reject_H0) %>%
+  arrange(desc(abs(beta_diff))) %>%
+  slice_head(n = 10) %>%
+  transmute(
+    Titul          = Name,
+    `α`            = round(alpha,      4),
+    `β⁺ (bull)`    = round(beta_plus,  4),
+    `β⁻ (bear)`    = round(beta_minus, 4),
+    `β⁻ − β⁺`     = round(beta_diff,  4),
+    `γ`            = round(gamma,      4),
+    `SE(γ)`        = round(se_gamma,   4),
+    `t(γ)`         = round(t_gamma,    3),
+    `p-value`    = round(p_gamma,    4)
+  ) %>%
+  kbl(
+    caption = "Top 10 titulov s najvýraznejšou asymetriou β⁺ ≠ β⁻ (p < 0,05)",
+    align   = c("l", rep("r", 8))
+  ) %>%
+  kable_styling(
+    bootstrap_options = c("striped", "hover"),
+    full_width        = TRUE,
+    font_size         = 13
+  ) %>%
+  row_spec(0, bold = TRUE, background = "#2c7bb6", color = "white") %>%
+  column_spec(5,
+    color     = ifelse(
+      (dual_results %>% filter(reject_H0) %>%
+         arrange(desc(abs(beta_diff))) %>% slice_head(n = 10))$beta_diff > 0,
+      "firebrick", "darkgreen"
+    ),
+    bold = TRUE
+  )
+```
+
+```{r dual-beta-scatter, fig.height=5, fig.cap="Porovnanie bull-bety a bear-bety pre všetky tituly"}
+# ── 5. Scatter β⁺ vs β⁻ ──────────────────────────────────────────────────────
+dual_results %>%
+  ggplot(aes(x = beta_plus, y = beta_minus,
+             color = reject_H0, alpha = reject_H0, size = reject_H0)) +
+  geom_abline(slope = 1, intercept = 0,
+              linetype = "dashed", color = "grey50", linewidth = 0.8) +
+  geom_point() +
+  scale_color_manual(
+    values = c("FALSE" = "steelblue", "TRUE" = "firebrick"),
+     labels = c(
+    "FALSE" = expression("Nezamietame " * H[0] (symetria)),
+    "TRUE"  = expression("Zamietame " * H[0] (asymetria))
+  )
+  ) +
+  scale_alpha_manual(values = c("FALSE" = 0.25, "TRUE" = 0.85), guide = "none") +
+  scale_size_manual( values = c("FALSE" = 1.2,  "TRUE" = 2.2),  guide = "none") +
+  labs(
+    title    = "Porovnanie β⁺ (bull) a β⁻ (bear) pre všetky tituly",
+    subtitle = "Prerušovaná čiara = línia symetrie (β⁺ = β⁻)",
+    x        = "β⁺  (beta pri raste trhu, bull mesiace)",
+    y        = "β⁻  (beta pri poklese trhu, bear mesiace)",
+    color    = "Záver testu:"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title      = element_text(hjust = 0.5, face = "bold"),
+    plot.subtitle   = element_text(hjust = 0.5, size = 10),
+    panel.grid.minor = element_blank()
+  )
+```
+
+```{r dual-beta-pvalue-plot, fig.height=5, fig.cap="p-hodnoty testu H₀: γⱼ = 0 pre každý titul (zoradené vzostupne)"}
+# ── 6. p-hodnoty testu γ = 0 ─────────────────────────────────────────────────
+dual_results %>%
+  arrange(p_gamma) %>%
+  mutate(rank = row_number()) %>%
+  ggplot(aes(x = rank, y = p_gamma, color = reject_H0)) +
+  geom_point(size = 1.2, alpha = 0.7) +
+  geom_hline(yintercept = 0.05, linetype = "dashed", color = "black") +
+  annotate("text", x = 5, y = 0.08, label = "alpha = 0.05",
+           hjust = 0, size = 3, fontface = "italic") +
+  scale_color_manual(
+    values = c("FALSE" = "darkblue", "TRUE" = "darkred"),
+    labels = c("FALSE" = "Nezamietame H₀  (β⁺ = β⁻)",
+               "TRUE"  = "Zamietame H₀  (β⁺ ≠ β⁻)")
+  ) +
+  scale_y_continuous(limits = c(0, 1)) +
+  labs(
+    title    = "p-hodnoty testu H₀: γⱼ = 0 (β⁺ = β⁻) pre každý titul",
+    subtitle = "Test asymetrie bety – dual-beta model",
+    x        = "Poradie titulov (zoradené podľa p-hodnoty)",
+    y        = "p-hodnota",
+    color    = "Výsledok testu:"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    plot.title       = element_text(hjust = 0.5, face = "bold"),
+    plot.subtitle    = element_text(hjust = 0.5, size = 10),
+    panel.grid.minor = element_blank()
+  )
+```
+
+```{r dual-beta-diff-hist, fig.height=4, fig.cap="Distribúcia rozdielu β⁻ − β⁺ pre všetky tituly"}
+# 7. Distribúcia rozdielu β⁻ − β
+dual_results %>%
+  ggplot(aes(x = beta_diff, fill = reject_H0)) +
+  geom_histogram(bins = 50, color = "white", alpha = 0.8) +
+  
+  geom_vline(xintercept = 0, linetype = "dashed",
+             color = "black", linewidth = 0.8) +
+  
+  scale_fill_manual(
+    values = c("FALSE" = "steelblue", "TRUE" = "firebrick"),
+    labels = c(
+      "FALSE" = expression("Nezamietame " * H[0]),
+      "TRUE"  = expression("Zamietame " * H[0])
+    )
+  ) + 
+  
+  labs(
+    title    = "Distribúcia rozdielu β⁻ − β⁺",
+    subtitle = "Kladné hodnoty: akcia citlivejšia pri poklese trhu (β⁻ > β⁺)",
+    x        = "β⁻ − β⁺",
+    y        = "Počet titulov",
+    fill     = "Záver testu:"
+  ) +
+  
+  theme_minimal(base_size = 11) +
+  theme(
+    plot.title       = element_text(hjust = 0.5, face = "bold"),
+    plot.subtitle    = element_text(hjust = 0.5, size = 10),
+    panel.grid.minor = element_blank()
+  )
+
+# Pomocné štatistiky pre inline komentár
+med_diff   <- round(median(dual_results$beta_diff), 4)
+n_bear_dom <- sum(dual_results$beta_diff > 0)   # β⁻ > β⁺
+n_bull_dom <- sum(dual_results$beta_diff < 0)   # β⁺ > β⁻
+pct_bear_dom <- round(100 * n_bear_dom / n_total_dual, 1)
+
+# Top asymetrické tituly pre komentár
+top_asym <- dual_results %>%
+  filter(reject_H0) %>%
+  arrange(desc(abs(beta_diff))) %>%
+  slice_head(n = 5) %>%
+  pull(Name)
+```
+
+::: komentar
+**Výsledky testu H₀: γⱼ = 0 (β⁺ = β⁻) na hladine 5 %:**
+
+-   Na hladine významnosti 5 % **nezamietame** H₀ pre **`r n_symetria` titulov** (`r pct_sym` %) — pre tieto akcie neexistuje štatistický dôkaz o asymetrii bety, čo je v základnom súlade so štandardným CAPM.
+
+-   **Zamietame** H₀ pre **`r n_asymetria` titulov** (`r pct_asym` %) — tieto akcie vykazujú štatisticky významne odlišnú reakciu na rastúci a klesajúci trh.
+
+-   Medián rozdielu β⁻ − β⁺ pre všetky tituly je `r med_diff` — mierne kladná hodnota naznačuje tendenciu k vyššej citlivosti pri poklese trhu. Celkovo `r n_bear_dom` titulov (`r pct_bear_dom` %) má β⁻ \> β⁺.
+
+-   Najvýraznejšiu asymetriu vykazujú tituly: **`r paste(top_asym, collapse = ", ")`**. Energetické spoločnosti majú tendenciu k výrazne vyššej β⁻ (silnejší pokles pri medvedích trhoch), zatiaľ čo rastové technologické tituly vykazujú opačný vzor (β⁺ \> β⁻ — silnejší nárast pri bull markete).
+
+:::
+### 3.4 Security Market Line v období rastu a poklesu trhu
+
+Na základe dual-beta modelu z predchádzajúcej sekcie odhadujeme **Security Market Line
+samostatne pre bull a bear obdobia**. Postup je analogický s príkladom 2 a sekciou 3.2. ,
+avšak namiesto rozdelenia vzorky v čase rozdeľujeme pozorovania podľa **smeru pohybu trhu**:
+
+* **Bull SML** — odhadnutá výhradne na mesiacoch, kde $r_{m,t} - r_f > 0$, s betami
+  odhadnutými z tých istých mesiacov ($\beta^+$)
+* **Bear SML** — odhadnutá výhradne na mesiacoch, kde $r_{m,t} - r_f \leq 0$, s betami
+  odhadnutými z tých istých mesiacov ($\beta^-$)
+
+Pre každý režim testujeme platnosť CAPM:
+$$r_{pi} - r_f = \gamma_0 + \gamma_1 \beta_{pi} + \varepsilon_{pi}$$
+$$H_0^{(1)}: \gamma_0 = 0 \qquad H_0^{(2)}: \gamma_1 = \bar{r}_m^{\text{režim}} - r_f$$
+
+```{r sml-bull-bear-setup}
+
+returns_bull <- returns_data %>% filter(D_plus  == 1)
+returns_bear <- returns_data %>% filter(D_minus == 1)
+
+# Pozorovaná trhová prémia v každom režime (benchmark pre test γ₁)
+rm_bull <- mean(returns_bull$excess_rm)
+rm_bear <- mean(returns_bear$excess_rm)
+```
+
+```{r sml-bull-bear-betas}
+estimate_regime_betas <- function(data_regime) {
+  data_regime %>%
+    group_by(Name) %>%
+    filter(n() >= 5) %>%
+    nest() %>%
+    mutate(
+      model  = map(data, ~ lm(excess_j ~ excess_rm, data = .x)),
+      tidied = map(model, broom::tidy)
+    ) %>%
+    select(Name, tidied) %>%
+    unnest(tidied) %>%
+    select(Name, term, estimate) %>%
+    pivot_wider(names_from = term, values_from = estimate) %>%
+    rename(alpha = `(Intercept)`, beta = excess_rm) %>%
+    ungroup()
+}
+
+betas_bull <- estimate_regime_betas(returns_bull)
+betas_bear <- estimate_regime_betas(returns_bear)
+
+n_bull_titles <- nrow(betas_bull)
+n_bear_titles <- nrow(betas_bear)
+```
+
+```{r sml-bull-bear-portfolia}
+build_sml <- function(betas) {
+  betas %>%
+    mutate(portfolio = ntile(beta, 10)) %>%
+    group_by(portfolio) %>%
+    summarise(
+      Mean_Alpha = mean(alpha, na.rm = TRUE),
+      Mean_Beta  = mean(beta,  na.rm = TRUE),
+      .groups    = "drop"
+    )
+}
+
+portfolia_bull <- build_sml(betas_bull) %>% mutate(rezim = "Bull (rastúci trh)")
+portfolia_bear <- build_sml(betas_bear) %>% mutate(rezim = "Bear (klesajúci trh)")
+
+sml_bull <- lm(Mean_Alpha ~ Mean_Beta, data = portfolia_bull)
+sml_bear <- lm(Mean_Alpha ~ Mean_Beta, data = portfolia_bear)
+
+# Koeficienty
+g0_bull <- round(coef(sml_bull)[1], 5)
+g1_bull <- round(coef(sml_bull)[2], 5)
+g0_bear <- round(coef(sml_bear)[1], 5)
+g1_bear <- round(coef(sml_bear)[2], 5)
+
+p_g0_bull <- round(summary(sml_bull)$coefficients[1, 4], 4)
+p_g1_bull <- round(summary(sml_bull)$coefficients[2, 4], 4)
+p_g0_bear <- round(summary(sml_bear)$coefficients[1, 4], 4)
+p_g1_bear <- round(summary(sml_bear)$coefficients[2, 4], 4)
+
+# Wald test γ₀ = 0 pre oba režimy
+wald_bull  <- linearHypothesis(sml_bull, "(Intercept) = 0")
+wald_bear  <- linearHypothesis(sml_bear, "(Intercept) = 0")
+p_wald_bull <- round(wald_bull$`Pr(>F)`[2], 4)
+p_wald_bear <- round(wald_bear$`Pr(>F)`[2], 4)
+```
+
+```{r sml-bull-bear-graf, fig.height=6, fig.cap="Security Market Line – bull vs. bear obdobia"}
+# Vizualizácia SML pre oba režimy 
+bind_rows(portfolia_bull, portfolia_bear) %>%
+  mutate(rezim = factor(rezim,
+                        levels = c("Bull (rastúci trh)", "Bear (klesajúci trh)"))) %>%
+  ggplot(aes(x = Mean_Beta, y = Mean_Alpha)) +
+  geom_smooth(method = "lm", color = "red", linewidth = 1.2,
+              se = TRUE, fill = "salmon", alpha = 0.15) +
+  geom_hline(yintercept = 0, linetype = "dashed",
+             color = "grey50", linewidth = 0.8) +
+  geom_point(size = 8, color = "darkblue") +
+  geom_text(aes(label = portfolio), color = "white",
+            fontface = "bold", size = 4) +
+  facet_wrap(~ rezim, scales = "free") +
+  labs(
+    title    = "Security Market Line – bull vs. bear obdobia",
+    subtitle = "Červená línia = OLS fit SML; prerušovaná čiara = nulový nadvýnos (CAPM)",
+    x        = "Priemerná beta portfólia (β⁺ resp. β⁻)",
+    y        = "Priemerný nadvýnos portfólia (alfa)"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title    = element_text(face = "bold", size = 16, hjust = 0.5),
+    plot.subtitle = element_text(hjust = 0.5, size = 10),
+    axis.title    = element_text(face = "bold"),
+    strip.text    = element_text(face = "bold", size = 13),
+    plot.margin   = margin(20, 20, 20, 20, "pt")
+  )
+```
+
+```{r sml-bull-bear-koef-tabulka}
+# ── 5. Tabuľka koeficientov oboch SML modelov ────────────────────────────────
+bind_rows(
+  summary(sml_bull)$coefficients %>%
+    as.data.frame() %>%
+    rownames_to_column("Parameter") %>%
+    mutate(Režim = "Bull (rastúci trh)"),
+  summary(sml_bear)$coefficients %>%
+    as.data.frame() %>%
+    rownames_to_column("Parameter") %>%
+    mutate(Režim = "Bear (klesajúci trh)")
+) %>%
+  mutate(
+    Parameter = case_when(
+      Parameter == "(Intercept)" ~ "γ₀ (intercept)",
+      Parameter == "Mean_Beta"   ~ "γ₁ (sklon – beta)",
+      TRUE ~ Parameter
+    ),
+    across(where(is.numeric), ~ round(.x, 4))
+  ) %>%
+  select(Režim, Parameter, everything()) %>%
+  kbl(caption = "Koeficienty SML pre bull a bear obdobia") %>%
+  kable_styling(
+    bootstrap_options = c("striped", "hover"),
+    full_width        = TRUE,
+    font_size         = 13
+  ) %>%
+  row_spec(0, bold = TRUE, background = "#2c7bb6", color = "white") %>%
+  row_spec(2, extra_css = "border-bottom: 2px solid #2c7bb6;")
+```
+
+```{r sml-bull-bear-wald-tabulka}
+# ── 6. Waldov test γ₀ = 0 pre oba režimy ─────────────────────────────────────
+bind_rows(
+  wald_bull %>%
+    as.data.frame() %>%
+    mutate(Režim = "Bull (rastúci trh)"),
+  wald_bear %>%
+    as.data.frame() %>%
+    mutate(Režim = "Bear (klesajúci trh)")
+) %>%
+  filter(!is.na(F)) %>%
+  mutate(across(where(is.numeric), ~ round(.x, 4))) %>%
+  select(Režim, Df, `Sum of Sq` = `Sum of Sq`, F, `Pr(>F)`) %>%
+  kbl(caption = "Waldov test H₀: γ₀ = 0 pre bull a bear SML") %>%
+  kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed"),
+    full_width        = FALSE,
+    font_size         = 13
+  ) %>%
+  row_spec(0, bold = TRUE, background = "#2c7bb6", color = "white")
+```
+
+```{r sml-bull-bear-porovnanie}
+# ── 7. Súhrnná porovnávacia tabuľka ──────────────────────────────────────────
+tibble(
+  Charakteristika                  = c(
+    "Počet mesiacov v režime",
+    "Počet titulov (min. 5 obs.)",
+    "Pozorovaná trhová prémia r̄ₘ",
+    "γ₀ (intercept)",
+    "p-hodnota γ₀",
+    "Waldov test γ₀ = 0  (p-hodnota)",
+    "γ₁ (sklon SML)",
+    "p-hodnota γ₁",
+    "Smer SML",
+    "Záver: γ₀ = 0?"
+  ),
+  `Bull (rastúci trh)`  = c(
+    as.character(n_bull),
+    as.character(n_bull_titles),
+    paste0(round(rm_bull * 100, 3), " %"),
+    as.character(g0_bull),
+    as.character(p_g0_bull),
+    as.character(p_wald_bull),
+    as.character(g1_bull),
+    as.character(p_g1_bull),
+    ifelse(g1_bull > 0, "Kladný", "Záporný"),
+    ifelse(p_wald_bull < 0.05, "Zamietame H₀", "Nezamietame H₀")
+  ),
+  `Bear (klesajúci trh)` = c(
+    as.character(n_bear),
+    as.character(n_bear_titles),
+    paste0(round(rm_bear * 100, 3), " %"),
+    as.character(g0_bear),
+    as.character(p_g0_bear),
+    as.character(p_wald_bear),
+    as.character(g1_bear),
+    as.character(p_g1_bear),
+    ifelse(g1_bear > 0, "Kladný", "Záporný"),
+    ifelse(p_wald_bear < 0.05, "Zamietame H₀", "Nezamietame H₀")
+  )
+) %>%
+  kbl(caption = "Porovnanie SML parametrov: bull vs. bear obdobia",
+      align = c("l", "r", "r")) %>%
+  kable_styling(
+    bootstrap_options = c("striped", "hover"),
+    full_width        = TRUE,
+    font_size         = 13
+  ) %>%
+  row_spec(0, bold = TRUE, background = "#2c7bb6", color = "white") %>%
+  row_spec(c(6, 10), bold = TRUE,
+           background = "#f0f7ff") %>%
+  row_spec(10, bold = TRUE,
+           background = "#f0f7ff",
+           extra_css  = "border-top: 2px solid #2c7bb6;")
+```
+
+::: komentar
+**Bull SML ($\hat{\gamma}_0 = `r g0_bull`$, $\hat{\gamma}_1 = `r g1_bull`$):**
+Waldov test `r ifelse(p_wald_bull < 0.05, "zamietol", "nezamietol")` nulovosť interceptu
+($p = `r p_wald_bull`$). Sklon SML je
+`r ifelse(g1_bull > 0, "kladný, čo je v súlade s predpokladom CAPM — v rastúcom trhu sú akcie s vyššou betou odmeňované vyšším nadvýnosom.", "záporný, čo je v rozpore s predpokladom CAPM aj v rastúcom trhu — Low-Beta anomália pretrváva aj v bull obdobiach")`.
+:::
+
+::: komentar
+**Bear SML ($\hat{\gamma}_0 = `r g0_bear`$, $\hat{\gamma}_1 = `r g1_bear`$):**
+Waldov test `r ifelse(p_wald_bear < 0.05, "zamietol", "nezamietol")` nulovosť interceptu
+($p = `r p_wald_bear`$). Sklon SML je
+`r ifelse(g1_bear > 0, "kladný — napriek poklesu trhu akcie s vyššou bear-betou nevykazujú systematicky väčší nadvýnos.", "záporný — akcie s vysokou bear-betou (agresívne tituly) v klesajúcom trhu zaostávali ešte výraznejšie, než predpovedal CAPM")`.
+:::
+
+::: komentar
+**Porovnanie s celkovým CAPM (Príklad 2) a so SML na dvoch časových obdobiach (sekcia 3.2):**
+
+* Rozdelenie podľa trhového režimu odhaľuje, či záver o Low-Beta anomálii platí
+  symetricky alebo je koncentrovaný v jednom režime.
+* Ak má **bull SML kladný** a **bear SML záporný** sklon, anomália pochádza
+  predovšetkým z bear mesiacov — agresívne tituly sú trestané počas poklesov
+  silnejšie, ako predpovedá CAPM.
+* Ak sú oba sklony záporné, anomália je systematická bez ohľadu na smer trhu,
+  čo je konzistentné so závermi Príkladu 2 a sekcie 3.2 pre celé obdobie.
+* Nízky počet bear mesiacov (~`r n_bear`) znižuje štatistickú silu odhadov bear SML —
+  intervaly spoľahlivosti sú širšie a výsledky menej robustné ako pre bull obdobia.
+:::

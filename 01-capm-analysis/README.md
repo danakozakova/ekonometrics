@@ -21,7 +21,7 @@ Revízia a zjednotenie kódu a komentárov naprieč dokumentom.
 
 ## Dáta
 
-Verejný dataset **S&P 500 stock data** (denné ceny 505 titulov, 2013–2018), dostupný na Kaggle: https://www.kaggle.com/datasets/camnugent/sandp500
+Verejný dataset **S&P 500 stock data** (denné ceny 505 titulov, 2013–2018), dostupný na Kaggle: https://www.kaggle.com/datasets/rohitjain454/all-stocks-5yr
 
 Bezriziková sadzba je predpokladaná nulová; trhový index je konštruovaný ako rovnako vážený priemer mesačných výnosov všetkých titulov.
 

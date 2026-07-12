@@ -1,9 +1,9 @@
 ---
 title: "Okunov zákon v ekonomike Švajčiarska"
 author:
-- "Bc. Pavel-Jakub Novotný"
-- "Bc. Viktória Kudlejová"
-- "Bc. Adriana Bednáriková"
+- "Bc. P.-J. N."
+- "Bc. V. K."
+- "Bc. A. B."
 - "Mgr. Dana Kozáková"
 - "(Skupina 02, Tím 07)"
 date: "`r format(Sys.Date(), '%d. %m. %Y')`"
@@ -64,8 +64,8 @@ Použité datasety pochádzajú z OECD Data Explorer:
 - **Miera nezamestnanosti** – štvrťročné dáta, sezónne očistené (dostupné od 2010Q1)
 
 ```{r load-data}
-gdp_raw   <- read.csv("data1.csv")
-unemp_raw <- read.csv("data2.csv")
+gdp_raw   <- read.csv("data/data1.csv")
+unemp_raw <- read.csv("data/data2.csv")
 ```
 
 ```{r filtering}

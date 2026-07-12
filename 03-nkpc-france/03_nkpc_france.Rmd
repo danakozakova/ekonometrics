@@ -1,9 +1,9 @@
 ---
 title: "Novokeynesiánska Phillipsova krivka pre ekonomiku Francúzska"
 author:
-- "Bc. Pavel-Jakub Novotný"
-- "Bc. Viktória Kudlejová"
-- "Bc. Adriana Bednáriková"
+- "Bc. P.-J. N."
+- "Bc. V. K."
+- "Bc. A. B."
 - "Mgr. Dana Kozáková"
 - "(Skupina 02, Tím 07)"
 date: "`r format(Sys.Date(), '%d. %m. %Y')`"

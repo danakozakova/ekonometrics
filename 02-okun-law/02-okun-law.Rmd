@@ -1,0 +1,766 @@
+---
+title: "Okunov zákon v ekonomike Švajčiarska"
+author:
+- "Bc. Pavel-Jakub Novotný"
+- "Bc. Viktória Kudlejová"
+- "Bc. Adriana Bednáriková"
+- "Mgr. Dana Kozáková"
+- "(Skupina 02, Tím 07)"
+date: "`r format(Sys.Date(), '%d. %m. %Y')`"
+output:
+  html_document:
+    number_sections: false
+    toc: true
+    toc_float: true
+    theme: flatly
+    highlight: tango
+    code_folding: show
+    code_download: true
+    df_print: paged
+  pdf_document:
+    toc: true
+lang: sk
+subtitle: "Empirická analýza vzťahu medzi output gap a nezamestnanosťou v období 2010–2025"
+---
+
+```{=html}
+<style>
+.komentar {
+  background-color: #fdf3ee;
+  border-left: 4px solid #A0522D;
+  padding: 15px;
+  margin: 15px 0;
+  border-radius: 5px;
+}
+h2 { color: #A0522D; border-bottom: 2px solid #eee; padding-bottom: 5px; }
+</style>
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo       = TRUE,
+  fig.height = 6,
+  fig.width  = 10,
+  message    = FALSE,
+  warning    = FALSE,
+  fig.align  = "center"
+)
+library(tidyverse)
+library(ggplot2)
+library(forecast)
+library(patchwork)
+library(strucchange)
+```
+
+
+
+# Príklad 1: Voľba ekonomiky a príprava dát
+
+Analyzujeme ekonomiku **Švajčiarska (CHE)** v štvrťročnej frekvencii za obdobie **2010Q1 – 2025Q4**.
+
+Použité datasety pochádzajú z OECD Data Explorer:
+
+- **Reálny HDP** – výdavkový prístup, indexy, sezónne očistené
+- **Miera nezamestnanosti** – štvrťročné dáta, sezónne očistené (dostupné od 2010Q1)
+
+```{r load-data}
+gdp_raw   <- read.csv("data1.csv")
+unemp_raw <- read.csv("data2.csv")
+```
+
+```{r filtering}
+gdp <- gdp_raw %>%
+  filter(REF_AREA == "CHE",
+         TIME_PERIOD >= "2010-Q1") %>%
+  select(TIME_PERIOD, OBS_VALUE) %>%
+  rename(gdp_index = OBS_VALUE)
+
+unemp <- unemp_raw %>%
+  filter(REF_AREA == "CHE",
+         TIME_PERIOD >= "2010-Q1") %>%
+  select(TIME_PERIOD, OBS_VALUE) %>%
+  rename(unemployment_rate = OBS_VALUE)
+
+data <- inner_join(gdp, unemp, by = "TIME_PERIOD")
+```
+
+```{r ts-objects}
+# začiatok časového radu podľa prvého dostupného obdobia
+ts_start <- c(as.integer(substr(data$TIME_PERIOD[1], 1, 4)),
+              as.integer(substr(data$TIME_PERIOD[1], 7, 7)))
+
+gdp_ts <- ts(data$gdp_index,         start = ts_start, frequency = 4)
+u_ts   <- ts(data$unemployment_rate,  start = ts_start, frequency = 4)
+Time   <- ts(seq_along(gdp_ts),       start = ts_start, frequency = 4)
+```
+
+## Príklad 1.1: Vizualizácia a štrukturálne zmeny
+
+Pred akoukoľvek transformáciou vizuálne prehliadneme oba časové rady.
+
+```{r plot-raw}
+p1 <- autoplot(gdp_ts, colour = "salmon", size = 1) +
+  ggtitle("Reálny HDP Švajčiarska (index, 2015 = 100)") +
+  xlab("Čas") + ylab("Index") +
+  theme_minimal(base_size = 12)
+
+p2 <- autoplot(u_ts, colour = "salmon4", size = 1) +
+  ggtitle("Miera nezamestnanosti Švajčiarska (%)") +
+  xlab("Čas") + ylab("%") +
+  theme_minimal(base_size = 12)
+
+p1 / p2
+```
+
+::: komentar
+Reálny HDP Švajčiarska vykazuje v celom sledovanom období 2010–2025 rastúci trend, ktorý je prerušený jedným výrazným výkyvom – prudkým poklesom v roku 2020 spôsobeným pandémiou COVID-19, po ktorom nasledovalo rýchle zotavenie a návrat na rastovú trajektóriu. 
+
+Miera nezamestnanosti sa pohybuje v relatívne úzkom pásme 4–5,5 %, bez výrazného dlhodobého trendu. Aj tu je viditeľný prechodný nárast okolo roku 2020–2021, po ktorom nezamestnanosť klesla na predpandemické hodnoty. Tieto pozorovania naznačujú, že rok 2020 je najpravdepodobnejším kandidátom na štrukturálny zlom, ktorý formálne otestujeme v nasledujúcom kroku.
+:::
+
+Bod štrukturálneho zlomu identifikujeme datovo pomocou funkcie `breakpoints()` a následne ho overíme Chowovým testom.
+
+
+```{r breakpoints-and-chow}
+bp <- breakpoints(log(gdp_ts) ~ Time)
+summary(bp)
+
+# na základe BIC volíme m=2 (2020Q1 a 2022Q2); testujeme prvý zlom v 2020Q1
+break_index <- which(data$TIME_PERIOD == "2019-Q4")
+
+sctest(log(gdp_ts) ~ Time, type = "Chow", point = break_index)
+```
+
+::: komentar
+Funkcia `breakpoints()` identifikuje optimálne body štrukturálnych zlomov minimalizáciou BIC. BIC je najnižšie pri m = 2 alebo m = 3, pričom zlom v **2020Q1** sa objavuje konzistentne naprieč všetkými riešeniami – je teda štatisticky aj ekonomicky najvýznamnejší (pandémia COVID-19).
+
+Chowov test formálne testuje nulovú hypotézu o absencii zlomu v bode 2019Q4 (posledný štvrťrok pred identifikovaným zlomom). Na hladine významnosti 5 % nulovú hypotézu zamietame (F = 5.94, p = 0.004), čo potvrdzuje existenciu štrukturálneho zlomu v trende HDP v roku 2020Q1. Pre ďalší postup pracujeme s jedným zlomom v 2020Q1, čo je v súlade s vizuálnou analýzou aj ekonomickou interpretáciou (pandémia COVID-19). Prípadný druhý zlom v 2022Q2 môže odrážať obnovu po pandémii, no pre jednoduchosť modelu ho nezaraďujeme.
+:::
+
+```{r dummy}
+# dummy: 0 pred 2020Q1, 1 od 2020Q1
+D <- ts(ifelse(data$TIME_PERIOD >= "2020-Q1", 1, 0),
+        start = ts_start, frequency = 4)
+```
+
+
+## Príklad 1.2: Detrendovanie – získanie cyklických premenných
+
+### Cyklický HDP (output gap)
+
+Logaritmus reálneho HDP regresujeme na lineárny trend a dummy premennú $D_t$, ktorá zachytáva úrovňový posun spôsobený pandémiou. Model so zmenou sklonu trendu (interakčný člen $D_t \cdot (t - t^*)$) bol zamietnutý, keďže príslušný koeficient bol štatisticky nevýznamný (p = 0.052) – COVID-19 predstavoval krátkodobý šok, po ktorom sa ekonomika vrátila na pôvodnú rastovú trajektóriu.
+
+```{r model-gdp}
+log_gdp_ts <- log(gdp_ts)
+
+model_trend <- lm(log_gdp_ts ~ Time + I(D * Time))
+# summary(model_trend)
+s_y <- summary(model_trend)$coefficients
+```
+
+::: komentar
+**Interpretácia parametrov modelu trendu HDP:**
+
+Model replikovaný podľa Webera (5) má tvar:
+$$ y_t = \beta_0 + \beta_1 Time + \beta_2 D_t Time + \varepsilon_{1t} $$
+
+- $\beta_0$ = `r round(s_y[1,1], 3)` (p. sig = `r format.pval(s_y[1, 4], digits = 3)`) – počiatočná úroveň log HDP (v čase $Time = 0$); nemá priamu ekonomickú interpretáciu 
+- $\beta_1$ = `r round(s_y[2,1], 3)` (p. sig = `r format.pval(s_y[2, 4], digits = 3)`)– štvrťročné tempo rastu HDP; v log-aproximácii zodpovedá percentuálnemu rastu za štvrťrok, pričom sa predpokladá konštantné tempo počas celého sledovaného obdobia
+- $\beta_2$ = `r round(s_y[3,1], 3)` (p. sig = `r format.pval(s_y[3, 4], digits = 3)`) - spolu s $\beta_1$ predstavuje švrťročné tempo rastu po predpokladanom zlome (`r round(s_y[2,1] + s_y[3,1], 3)`)
+- $\epsilon_1t$ – reziduá predstavujú **output gap** 
+
+Napriek vizuálne zrejmému výkyvu v roku 2020 štatistické testy nepotvrdili trvalý štrukturálny zlom v trende HDP – ani zmenu sklonu, ani úrovňový posun. COVID-19 sa prejavil ako prechodný šok bez dlhodobých dôsledkov na trajektóriu švajčiarskeho HDP.
+
+Reziduá vynásobené 100 predstavujú **output gap** – percentuálnu odchýlku skutočného HDP od jeho potenciálnej (trendovej) úrovne. Keďže sa nepotvrdil štrukturálny zlom, pre ďalšie použitie sme ich odhadli bez dummy premennej.
+:::
+
+```{r yc}
+yc_ts <- ts(residuals(lm(log_gdp_ts ~ Time)) * 100, start = ts_start, frequency = 4)
+# autoplot(yc_ts, size = 1, colour = 'black', facet = FALSE)
+```
+
+### Cyklická nezamestnanosť
+
+Mieru nezamestnanosti regresujeme na dummy premennú, čím zachytíme možný úrovňový posun priemernej miery nezamestnanosti po zlomu.
+
+```{r model-u}
+model_u <- lm(u_ts ~  D)
+summary(model_u)
+s_u <- summary(model_u)$coefficients
+```
+::: komentar
+**Interpretácia parametrov modelu trendu nezamestnanosti (rovnica 6):**
+
+Model replikovaný podľa Webera (5) má tvar:
+$$ U_t = \gamma_0 + \gamma_1 D_t + \varepsilon_{2t} $$
+
+- $\gamma_0$ = `r round(s_u[1,1], 3)` (p. sig = `r format.pval(s_u[1, 4], digits = 3)`) – priemerná miera nezamestnanosti počas celého sledovaného obdobia; aproximácia prirodzenej miery nezamestnanosti $u^*$
+- $\gamma_1$ = `r round(s_u[2,1], 3)` (p. sig = `r format.pval(s_u[2, 4], digits = 3)`) - predstavuje zmenu prirodzenej miery nezamestnanosti rastu po predpokladanom zlome (`r round(s_u[1,1] + s_u[2,1], 3)`). Táto odchýlka je na hladine 5% nevýznamná
+- $\epsilon_2t$ – reziduá predstavujú **cyklickú nezamestnanosť**, teda odchýlku skutočnej miery od jej dlhodobého priemeru
+
+Regresiu nezamestnanosti na dummy premennú $D_t$ sme zamietli, keďže koeficient nebol štatisticky významný (p = 0.074) – pandémia teda nezanechala trvalý úrovňový posun v priemernej miere nezamestnanosti. Výsledok je konzistentný so záverom pre HDP: švajčiarska ekonomika prekonala COVID-19 šok bez trvalých štrukturálnych dôsledkov. Pre ďalšie použitie sme reziduá (cyklickú nezamestnanosť) odhadli bez dummy premennej.
+
+:::
+
+```{r uc}
+uc_ts <- ts(residuals(lm(u_ts ~  1)), start = ts_start, frequency = 4)
+# autoplot(uc_ts, size = 1, colour = 'black', facet = FALSE)
+```
+
+
+## Príklad 1.3: Vizualizácia cyklických premenných
+
+```{r plot-cycles}
+p3 <- autoplot(yc_ts, colour = "salmon", size = 1) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey40") +
+  ggtitle("Output gap – cyklický HDP (%)") +
+  xlab("Čas") + ylab("%") +
+  theme_minimal(base_size = 12)
+
+p4 <- autoplot(uc_ts, colour = "salmon4", size = 1) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey40") +
+  ggtitle("Cyklická nezamestnanosť (p.b.)") +
+  xlab("Čas") + ylab("p.b.") +
+  theme_minimal(base_size = 12)
+
+p3 / p4
+```
+
+::: komentar
+Grafy potvrdzujú očakávanú inverznú závislosť medzi output gap a cyklickou nezamestnanosťou, ktorá je najvýraznejšia v roku 2020 – prudký prepad HDP pod potenciál (output gap až −7 %) sa zrkadlí v súčasnom náraste cyklickej nezamestnanosti nad nulu. Mimo tohto epizodického šoku sú obe cyklické premenné relatívne blízko nuly, čo odráža celkovú stabilitu švajčiarskej ekonomiky v sledovanom období. Vzájomný protipohyb je teda prítomný, no v bežných časoch (mimo krízy) je menej výrazný – čo môže naznačovať slabší alebo oneskorený Okunov vzťah, ktorý bude predmetom ďalšej analýzy.
+:::
+
+::: komentar
+**Poznámka k použitiu dummy premennej:**
+
+Zadanie predpokladá zahrnutie dummy premennej do modelov trendu HDP a nezamestnanosti (rovnice 5 a 6) s cieľom zachytiť možné štrukturálne zmeny. V našom prípade sme dummy premennú $D_t$ indikujúcu obdobie od 2020Q1 definovali a jej relevantnosť sme overili formálnymi testami.
+
+Pre model trendu HDP sme postupne testovali **zmenu sklonu trendu** (interakčný člen $D_t \cdot (t - t^*)$, p = 0.052) aj **úrovňový posun** ($D_t$, p = 0.138) – ani jeden koeficient nebol štatisticky významný na hladine 5 %. Pre model nezamestnanosti bol výsledok obdobný ($D_t$, p = 0.074). **Na základe týchto výsledkov sme dummy premennú z finálnych modelov vypustili.**
+
+Tento záver má aj ekonomickú oporu: Švajčiarsko patrí medzi najodolnejšie ekonomiky sveta s flexibilným trhom práce a silnou fiškálnou pozíciou, čo umožnilo rýchle zotavenie po pandémickom šoku **bez trvalých štrukturálnych dôsledkov**.
+:::
+
+# Príklad 2: Odhad Okunova vzťahu
+
+V tejto časti na základe detrendovaných hodnôt vypočítame odhad Okunovho koeficienta a posúdime jeho stabilitu.
+
+## Príklad 2.1: Základný statický odhad modelu
+
+Odhadujeme základnú statickú verziu Okunovho vzťahu (3) s využitím zistených rezíduí z prvej časti. Podľa Weberovej metodiky predpokladáme, že dlhodobá očakávaná hodnota oboch premenných je nulová ($E[U_t^c] = 0$), preto model odhadujeme bez absolútneho člena (interceptu). Pre úplnosť a uistenie však pridávame aj referenčný model s interceptom.
+
+   > $$ U_t^c = \alpha \cdot y_t^c, \quad \alpha < 0 $$
+
+```{r okun-static, warning=FALSE, message=FALSE}
+library(broom)
+
+Okun_1 <- lm(uc_ts ~ yc_ts - 1)
+Okun_2 <- lm(uc_ts ~ yc_ts)
+
+# Spoločná tabuľka oboch modelov pomocou broom + knitr::kable
+tidy_join <- function(m, label) {
+  t <- tidy(m)
+  t$term <- dplyr::recode(t$term,
+    "yc_ts"       = "Cyklický output (HDP gap)",
+    "(Intercept)" = "Absolútny člen (Intercept)")
+  t$Model <- label
+  t[, c("Model","term","estimate","std.error","statistic","p.value")]
+}
+
+tbl <- rbind(tidy_join(Okun_1, "Okun_1 (bez interceptu)"),
+             tidy_join(Okun_2, "Okun_2 (s interceptom)"))
+colnames(tbl) <- c("Model", "Premenná", "Odhad", "Std. chyba", "t-štatistika", "p-hodnota")
+
+knitr::kable(tbl, digits = 4, align = c("l","l","r","r","r","r"),
+             caption = "Výsledky rovnice 3: Okun_1 (bez interceptu), Okun_2 (s interceptom)")
+
+s_o1 <- summary(Okun_1)$coefficient
+s_o2 <- summary(Okun_2)$coefficient
+```
+
+::: komentar
+**Interpretácia základnej statickej rovnice (3):**
+
+Zo základného modelu bez konštanty dostávame koeficient $\alpha$ = `r round(s_o1[1,1], 3)` ($p.sig$ = `r format.pval(s_o1[1,4], digits = 4)`). Tento koeficient vyjadruje citlivosť zmeny output gap na zmenu nezamestnanosti počas sledovaného obdobia. 
+
+Referenčný odhad pre model s konštantou ukazuje, že v tabuľke ukazuje, že intercept pre reálny model je zanedbateľný ($\alpha$ = `r round(s_o2[1,1], 3)`, $p.sig$ = `r format.pval(s_o2[1,4], digits = 4)`), čo potvrdzuje platnosť nášho prvotného detrendovania.
+:::
+
+## Príklad 2.2: Chowov test štrukturálneho zlomu a predpovedný test
+
+V prvom príklade sme identifikovali teoretický zlom v dátach (pandémia od 2020Q1). Následne vykonáme oba Chowove testy štrukturálnej stability Okunovho vzťahu.
+
+**Chowov test štrukturálneho zlomu** (Hejl, rovnica 5.20) rozdelí vzorku na dve časti o veľkostiach $n_1$ (pred zlomom) a $n_2 = n - n_1$ (po zlome). Pre každú sub-vzorku sa odhadne samostatný model:
+
+$$U_{1,t}^c = \alpha_1 \cdot y_{1,t}^c + \varepsilon_{1t}, \quad t = 1, \ldots, n_1 \tag{5.17a}$$
+$$U_{2,t}^c = \alpha_2 \cdot y_{2,t}^c + \varepsilon_{2t}, \quad t = n_1+1, \ldots, n \tag{5.17b}$$
+
+$S_0$ je RSS z obmedzeného (spoločného) modelu, $S_1$ a $S_2$ sú RSS z dvoch sub-regresií. Nulová hypotéza $H_0: \alpha_1 = \alpha_2$ (stabilita Okunovho koeficientu) sa testuje F-testom:
+
+$$F = \frac{(S_0 - S_1 - S_2)/k}{(S_1 + S_2)/(n_1 + n_2 - 2k)} \sim F(k,\ n_1+n_2-2k) \tag{5.20}$$
+
+**Chowov predpovedný test** (Hejl, rovnica za 5.22) je alternatívou vhodnou vtedy, keď je post-breaková vzorka malá ($n_2 < k$). Model sa odhadne len na prvých $n_1$ pozorovaniach:
+
+$$U_t^c = \alpha \cdot y_t^c + \varepsilon_t, \quad t = 1, \ldots, n_1$$
+
+a testuje sa, či posledných $n_2$ pozorovaní zodpovedá tomu istému modelu ($H_0: \gamma_j = 0$ pre $j = n_1+1, \ldots, n$). F-štatistika má tvar:
+
+$$F = \frac{(S_0 - S_1)/n_2}{S_1/(n_1 - k)} \sim F(n_2,\ n_1-k)$$
+
+kde $S_0$ je RSS z modelu na celej vzorke a $S_1$ je RSS z modelu odhadnutého len na prvých $n_1$ pozorovaniach.
+
+
+
+
+
+```{r chow-test}
+break_index <- which(data$TIME_PERIOD == "2020-Q1")
+
+chow_bp <- sctest(uc_ts ~ yc_ts - 1, type = "Chow", point = break_index)
+
+n  <- length(uc_ts)
+k  <- 1
+n1 <- break_index - 1
+n2 <- n - n1
+
+uc_pre  <- uc_ts[1:n1];    yc_pre  <- yc_ts[1:n1]
+uc_post <- uc_ts[(n1+1):n]; yc_post <- yc_ts[(n1+1):n]
+
+model_pre   <- lm(uc_pre ~ yc_pre - 1)
+rss_pre     <- sum(residuals(model_pre)^2)
+alpha_pre   <- coef(model_pre)[1]
+pred_errors <- uc_post - alpha_pre * yc_post
+rss_pred    <- sum(pred_errors^2)
+
+F_pred <- (rss_pred / n2) / (rss_pre / (n1 - k))
+p_pred <- pf(F_pred, df1 = n2, df2 = n1 - k, lower.tail = FALSE)
+```
+
+
+**Chow Breakpoint Test** 
+
+- dosiahol F-štatistiku `r round(chow_bp$statistic, 3)` (p = `r format.pval(chow_bp$p.value, digits = 3)`). 
+- na hladine 5 % *nezamietame* nulovú hypotézu $H_0: \alpha_1 = \alpha_2$
+- Okunov koeficient sa preukázateľne nezmenil pred a po roku 2020Q1.
+
+**Chow Predictive Test** 
+
+- dosiahol F-štatistiku `r round(F_pred, 3)` s $n_2 = `r n2`$ stupňami voľnosti v čitateli (p = `r format.pval(p_pred, digits = 3)`) 
+- na hladine 5 % *zamietame* nulovú hypotézu 
+– model odhadnutý na pred-covidových dátach nedokáže dobre predikovať pozorovania z obdobia 2020Q1–2025Q4.
+
+Výsledky oboch testov sú zdanlivo protichodné, ale ekonomicky konzistentné. 
+
+Breakpoint test sa pýta úzko: *zmenil sa koeficient $\alpha$?* Predictive test sa pýta širšie: *zodpovedajú post-breakové pozorovania predcovidovému modelu?* 
+
+Predictive test je citlivý aj na zmenu variancie rezíduí a na odľahlé pozorovania – kvartál 2020Q2 predstavoval bezprecedentný šok. 
+
+Záver teda znie: Okunov *koeficient* zostal stabilný, ale obdobie po začiatku covidu generovalo systematické odchýlky od predcovidového modelu.
+
+
+## Príklad 2.3: Statický odhad s interaktívnou premennou pre zlom
+
+Aj keď sa dummy premenná nepreukázala významná v úvode testovani, otestujeme formálne model tak, ako určuje Zadanie (rovnica 3' so zahrnutím štrukturálneho zlomu pre slope koeficient):
+$$ U_t^c = \alpha_1 y_t^c + \alpha_2 D_t y_t^c + \varepsilon_t $$
+
+Rozšírime základnú statickú regresiu o interakčný člen. To nám overí, či sa náhodou citlivosť Okunovho vzťahu (odhad $\alpha$) výrazne nezmenila pre post-krízové kvartály (po roku 2020Q1).
+
+```{r okun-dummy}
+Okun_3     <- lm(uc_ts ~ yc_ts + I(D * yc_ts) - 1)
+s_o3       <- summary(Okun_3)$coefficients
+
+a1         <- s_o3[1, 1]
+se_a1      <- s_o3[1, 2]
+a2         <- s_o3[2, 1]
+a_po       <- a1 + a2
+
+Sigma      <- vcov(Okun_3)
+se_a_po    <- sqrt(Sigma[1,1] + Sigma[2,2] + 2 * Sigma[1,2])
+
+s_o3
+```
+
+Okunov koeficient **pred zlomom** ($\alpha_1$) = `r round(a1, 4)` (SE = `r round(se_a1, 4)`), 95 % interval: [`r round(a1 - 2*se_a1, 4)`, `r round(a1 + 2*se_a1, 4)`].
+
+Okunov koeficient **po zlome** ($\alpha_1 + \alpha_2$) = `r round(a_po, 4)` (SE = `r round(se_a_po, 4)`), 95 % interval: [`r round(a_po - 2*se_a_po, 4)`, `r round(a_po + 2*se_a_po, 4)`].
+
+Interakčný člen $\alpha_2$ = `r round(a2, 4)` (p = `r format.pval(s_o3[2, 4], digits = 3)`). Oba intervaly spoľahlivosti sa prekrývajú, čo potvrdzuje záver z Chowovho testu: Okunov koeficient zostal pred a po pandémii štatisticky nerozlíšiteľný.
+
+```{r okun-dummy-plot, fig.height=3.5, fig.width=7}
+data.frame(
+  obdobie = factor(
+    c("Celá vzorka\n(Okun_1)", "Pred zlomom\n(2010Q1–2019Q4)", "Po zlome\n(2020Q1–2025Q4)"),
+    levels = c("Celá vzorka\n(Okun_1)", "Pred zlomom\n(2010Q1–2019Q4)", "Po zlome\n(2020Q1–2025Q4)")
+  ),
+  odhad = c(s_o1[1, 1], a1,    a_po),
+  se    = c(s_o1[1, 2], se_a1, se_a_po)
+) |>
+  ggplot(aes(x = obdobie, y = odhad, colour = obdobie)) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey60") +
+  geom_errorbar(aes(ymin = odhad - 2*se, ymax = odhad + 2*se),
+                width = 0.12, linewidth = 0.8) +
+  geom_point(size = 4) +
+  scale_colour_manual(values = c("grey40", "salmon", "salmon4")) +
+  labs(title    = "Okunov koeficient – porovnanie modelov",
+       subtitle = "Bodový odhad ± 2 × SE  (≈ 95 % interval spoľahlivosti)",
+       x = NULL, y = expression(hat(alpha))) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "none")
+```
+
+
+Grafické porovnanie intervalov spoľahlivosti odhaľuje zaujímavý vzor. Odhad na **celej vzorke** (Okun_1) je precízny a štatisticky významný. 
+
+Po rozdelení vzorky však vidíme, že **pred-covidové obdobie** (2010–2019) vykazuje koeficient blízky nule so širokým intervalom, ktorý prechádza nulou – vzťah medzi produkčnou medzerou a nezamestnanosťou bol teda v tejto fáze relatívne stabilného rastu štatisticky nerozlíšiteľný od nuly. 
+
+Naopak, **post-covidové obdobie** (2020–2025) ukazuje silnejší a presnejší odhad, ťahaný dramatickým synchronizovaným pohybom oboch premenných počas šoku 2020. 
+
+Výsledky však treba interpretovať opatrne – môže ísť o artefakt nižšej variability švajčiarskej ekonomiky v rokoch 2010–2019. Podobné hodnoty regresora prirodzene vedú k vyššej štatistickej neistote odhadu, nie nevyhnutne k slabšiemu reálnemu vzťahu.
+
+## Príklad 2.4: Asymetria Okunovho vzťahu
+
+Posledným aspektom statickej analýzy je preverenie asymetrie Okunovho vzťahu. Reaguje trh práce na rovnako veľký nárast a pokles HDP rovnako symetricky, alebo je citlivejší v jednom smere? Testujeme model kde sa koeficient môže líšiť podľa toho, či bola produkčná medzera pozitívna (expanzia) alebo negatívna (recesia):
+
+$$U_t^c = \alpha_{-} \cdot (1 - D_t^{+}) \cdot y_t^c + \alpha_{+} \cdot D_t^{+} \cdot y_t^c + \varepsilon_t$$
+
+kde $D_t^{+} = \mathbf{1}[y_t^c > 0]$. Koeficient $\alpha_{-}$ zachytáva Okunov vzťah v recesii, $\alpha_{+}$ v expanzii.
+
+```{r okun-asymmetry}
+D_asym    <- ifelse(yc_ts > 0, 1, 0)
+Okun_asym <- lm(uc_ts ~ I((1 - D_asym) * yc_ts) + I(D_asym * yc_ts) - 1)
+s_asym    <- summary(Okun_asym)$coefficients
+
+a_rec  <- s_asym[1, 1]; se_rec <- s_asym[1, 2]
+a_exp  <- s_asym[2, 1]; se_exp <- s_asym[2, 2]
+
+s_asym
+```
+
+Okunov koeficient v **recesii** ($\alpha_{-}$, $y_t^c \leq 0$) = `r round(a_rec, 4)` (SE = `r round(se_rec, 4)`), 95 % interval: [`r round(a_rec - 2*se_rec, 4)`, `r round(a_rec + 2*se_rec, 4)`].
+
+Okunov koeficient v **expanzii** ($\alpha_{+}$, $y_t^c > 0$) = `r round(a_exp, 4)` (SE = `r round(se_exp, 4)`), 95 % interval: [`r round(a_exp - 2*se_exp, 4)`, `r round(a_exp + 2*se_exp, 4)`].
+
+```{r okun-asymmetry-plot, fig.height=3.5, fig.width=6}
+data.frame(
+  faza  = factor(c("Recesia\n(yc ≤ 0)", "Expanzia\n(yc > 0)"),
+                 levels = c("Recesia\n(yc ≤ 0)", "Expanzia\n(yc > 0)")),
+  odhad = c(a_rec, a_exp),
+  se    = c(se_rec, se_exp)
+) |>
+  ggplot(aes(x = faza, y = odhad, colour = faza)) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey60") +
+  geom_errorbar(aes(ymin = odhad - 2*se, ymax = odhad + 2*se),
+                width = 0.12, linewidth = 0.8) +
+  geom_point(size = 4) +
+  scale_colour_manual(values = c("salmon4", "salmon")) +
+  labs(title    = "Asymetria Okunovho koeficientu",
+       subtitle = "Bodový odhad ± 2 × SE  (≈ 95 % interval spoľahlivosti)",
+       x = NULL, y = expression(hat(alpha))) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "none")
+```
+
+`r if(abs(a_rec) > abs(a_exp)) "Koeficient je väčší (v absolútnej hodnote) v recesii, čo zodpovedá bežne pozorovanej asymetrii – trh práce reaguje na pokles produkcie rýchlejšie než na jej rast (firmy prepúšťajú rýchlejšie, ako najímajú)." else "Koeficient je väčší (v absolútnej hodnote) v expanzii, čo by naznačovalo, že vo Švajčiarsku trh práce reaguje silnejšie na rastové cykly než na recesie."`
+
+# 3. Dynamická definícia koeficientov a dlhodobé efekty simulácie
+
+Ekonomika nereaguje okamžite. Ako podotýka Weber vo svojej rovnici (7), zmena výstupu sa na nezamestnanosti prejaví až s určitým zotrvačným oneskorením. Na rozdiel od statickej verzie (kde $U_t^c = \alpha \cdot y_t^c$), dynamická verzia zapája do hry autoregresívnu dynamiku t.j. minulé hodnoty samotnej nezamestnanosti a taktiež minulé hodnoty produkčnej medzery. 
+
+## Príklad 3.1: Dynamický model a výber optimálneho počtu oneskorení (Rovnica 7)
+
+Dynamický tvar Okunovho zákona podľa Webera má podobu (7):
+$$U_t^c = \sum_{i=1}^{k} \delta_{1i} U_{t-i}^c + \sum_{i=1}^{k} \delta_{2i} y_{t-i}^c + \varepsilon_t$$
+
+Naším prvým krokom je zvoliť optimálny počet oneskorení $k$. Odhadneme dynamické modely postupne pre $k \in \{1, 2, 3, 4\}$ a posúdime ich vhodnosť podľa Akaikeho (AIC) a Bayesovho (BIC) informačného kritéria. (Nižšia hodnota indikuje lepší balans medzi vysvetľovacou schopnosťou a zložitosťou modelu).
+
+```{r dynlm-lags, warning=FALSE, message=FALSE}
+library(dynlm)
+
+aic_vals <- numeric(4)
+bic_vals <- numeric(4)
+
+for (k in 1:4) {
+  # dynlm s oneskoreniami 1 až k pre uc aj yc bez interceptu
+  mod_k <- dynlm(uc_ts ~ L(uc_ts, 1:k) + L(yc_ts, 1:k) - 1)
+  aic_vals[k] <- AIC(mod_k)
+  bic_vals[k] <- BIC(mod_k)
+}
+
+# Prehľadná tabuľka informačných kritérií
+ic_table <- data.frame(
+  k       = 1:4,
+  AIC     = round(aic_vals, 3),
+  BIC     = round(bic_vals, 3)
+)
+knitr::kable(ic_table,
+             caption = "Informačné kritériá dynamického modelu (rovnica 7) pre k = 1 až 4",
+             align   = c("c", "r", "r"))
+
+k_aic <- which.min(aic_vals)
+k_bic <- which.min(bic_vals)
+```
+
+::: komentar
+Podľa AIC je optimálny počet oneskorení **k = `r k_aic`**, podľa BIC **k = `r k_bic`**. Keďže BIC trestá zložitosť modelu prísnejšie a obe kritériá sa v tomto prípade zhodujú, pracujeme v ďalšom postupe s modelom **k = `r k_bic`** ako základnou (úspornou) špecifikáciou.
+:::
+
+```{r dynlm-base-model}
+# Základný dynamický model (rovnica 7) s optimálnym počtom oneskorení
+k_opt   <- k_bic
+mod_opt <- dynlm(uc_ts ~ L(uc_ts, 1:k_opt) + L(yc_ts, 1:k_opt) - 1)
+summary(mod_opt)
+
+# Dlhodobý Okunov koeficient pre základný model (bez štrukturálneho zlomu)
+cf_opt  <- coef(mod_opt)
+d1_opt  <- sum(cf_opt[grep("L(uc_ts", names(cf_opt), fixed = TRUE)])
+d2_opt  <- sum(cf_opt[grep("L(yc_ts", names(cf_opt), fixed = TRUE)])
+aLR_basic <- d2_opt / (1 - d1_opt)
+
+# Robustnostný model s k = 4 (overenie citlivosti na počet lagov)
+mod_k4   <- dynlm(uc_ts ~ L(uc_ts, 1:4) + L(yc_ts, 1:4) - 1)
+cf_k4    <- coef(mod_k4)
+d1_k4    <- sum(cf_k4[grep("L(uc_ts", names(cf_k4), fixed = TRUE)])
+d2_k4    <- sum(cf_k4[grep("L(yc_ts", names(cf_k4), fixed = TRUE)])
+aLR_k4   <- d2_k4 / (1 - d1_k4)
+
+# Zhrňujúca tabuľka dlhodobých koeficientov pre základný model
+knitr::kable(
+  data.frame(
+    Specifikacia = c(paste0("Optimálne (k = ", k_opt, ")"),
+                     "Preparametrizované (k = 4)"),
+    sum_d1 = round(c(d1_opt, d1_k4), 4),
+    sum_d2 = round(c(d2_opt, d2_k4), 4),
+    aLR    = round(c(aLR_basic, aLR_k4), 4)
+  ),
+  caption   = "Dlhodobý Okunov koeficient – základný dynamický model (rovnica 7)",
+  align     = c("l", "r", "r", "r"),
+  col.names = c("Špecifikácia", "Súčet d1i", "Súčet d2i", "a^LR")
+)
+```
+
+::: komentar
+**Dlhodobý Okunov koeficient – základný dynamický model (rovnica 7):**
+
+Dlhodobý koeficient $a^{LR}$ vyjadruje celkový kumulovaný vplyv trvalej zmeny cyklického HDP o 1 percentuálny bod na cyklickú mieru nezamestnanosti po úplnom odoznení dynamiky modelu. Pre optimálnu špecifikáciu s **k = `r k_opt`** dostávame $a^{LR}$ = **`r round(aLR_basic, 4)`**, čo je v súlade s očakávaním Okunovho zákona (záporný koeficient).
+
+Porovnanie s preparametrizovaným modelom (k = 4), kde $a^{LR}$ = `r round(aLR_k4, 4)`, ukazuje na **citlivosť výsledkov na výber počtu oneskorení**: zahrnutie nevýznamných oneskorení môže destabilizovať odhad. Preto budeme v ďalšej analýze pracovať paralelne s oboma variantmi (k = 1 a k = 4) a porovnávať ich.
+:::
+
+## Príklad 3.2 - 3.3: Štrukturálny zlom v dynamickej verzii
+
+Na základe teórie otestujeme dynamickú verziu Okunovho zákona (rovnica 7') na prítomnosť štrukturálneho zlomu počas pandémie COVID-19. Máme dva základné predpoklady o tom, ako mohla pandémia zasiahnuť trh práce:
+
+1. **Čiastočný zlom:** Zmenila sa len priama citlivosť nezamestnanosti na výstup, teda dummy interaguje iba s oneskorenými produkčnými medzerami (`D * yc`).
+$$ U_t^c = \sum_{i=1}^{k} \delta_{1i} U_{t-i}^c + \sum_{i=1}^{k} \delta_{2i} y_{t-i}^c +  \sum_{i=1}^{k} \delta_{21i} D_t y_{t-i}^c + \varepsilon_{3t} $$
+
+2. **Úplný zlom:** Zmenila sa aj samotná zotrvačnosť (autoregresia) na trhu práce, takže dummy interaguje s výstupom aj s minulou nezamestnanosťou (`D * uc`).
+
+$$ U_t^c = \sum_{i=1}^{k} \delta_{1i} U_{t-i}^c + \sum_{i=1}^{k} \delta_{2i} y_{t-i}^c + \sum_{i=1}^{k} \delta_{11i} D_t U_{t-i}^c + \sum_{i=1}^{k} \delta_{21i} D_t y_{t-i}^c + \varepsilon_{3t} $$
+
+Zároveň overíme **citlivosť na nevýznamné oneskorenia** porovnaním presaturovaných modelov ($k=4$) s modelmi so statisticky optimálnym počtom lagov ($k=1$). Celkovo teda odhadujeme 4 varianty.
+
+```{r okun-break-models}
+# --- 1) Čiastočný zlom, k = 4 ---
+Okun_pb_4 <- dynlm(uc_ts ~ L(uc_ts, 1:4) + L(yc_ts, 1:4) + L(I(D * yc_ts), 1:4) - 1)
+
+# --- 2) Úplný zlom, k = 4 ---
+Okun_fb_4 <- dynlm(uc_ts ~ L(uc_ts, 1:4) + L(yc_ts, 1:4) + 
+                           L(I(D * uc_ts), 1:4) + L(I(D * yc_ts), 1:4) - 1)
+
+# --- 3) Čiastočný zlom, k = 1 ---
+Okun_pb_1 <- dynlm(uc_ts ~ L(uc_ts, 1) + L(yc_ts, 1) + L(I(D * yc_ts), 1) - 1)
+
+# --- 4) Úplný zlom, k = 1 ---
+Okun_fb_1 <- dynlm(uc_ts ~ L(uc_ts, 1) + L(yc_ts, 1) + 
+                           L(I(D * uc_ts), 1) + L(I(D * yc_ts), 1) - 1)
+```
+
+Následne z každého modelu odvodíme **dlhodobé Okunove koeficienty** (pred a po zlome). 
+
+Pre obmedzenejší model s **čiastočným zlomom** sa dlhodobé dopady počítajú takto:
+$$a^{LR}_1 = \frac{\sum_{i=1}^k \delta_{2i}}{1 - \sum_{i=1}^k \delta_{1i}}, \qquad a^{LR}_2 = \frac{\sum_{i=1}^k \delta_{2i} + \sum_{i=1}^k \delta_{21i}}{1 - \sum_{i=1}^k \delta_{1i}}$$
+
+Pre robustnejší model s **úplným zlomom** sa do vzorca pocovide započítava aj tlmiaci vplyv (zmenená pamäť) na oboch stranách zlomku:
+$$a^{LR}_1 = \frac{\sum_{i=1}^k \delta_{2i}}{1 - \sum_{i=1}^k \delta_{1i}}, \qquad a^{LR}_2 = \frac{\sum_{i=1}^k \delta_{2i} + \sum_{i=1}^k \delta_{21i}}{1 - \sum_{i=1}^k \delta_{1i} - \sum_{i=1}^k \delta_{11i}}$$
+
+```{r extract-aLR}
+# Funkcia na extrakciu koeficientov z modelu
+get_aLR <- function(model_obj, model_type) {
+  cf <- coef(model_obj)
+  
+  d1 <- sum(cf[grep("L(uc_ts", names(cf), fixed = TRUE)])
+  d2 <- sum(cf[grep("L(yc_ts", names(cf), fixed = TRUE)])
+  
+  if(model_type == "partial") {
+    d4 <- sum(cf[grep("D * yc_ts", names(cf), fixed = TRUE)])
+    a_pred <- d2 / (1 - d1)
+    a_po   <- (d2 + d4) / (1 - d1)
+  } else {
+    d3 <- sum(cf[grep("D * uc_ts", names(cf), fixed = TRUE)])
+    d4 <- sum(cf[grep("D * yc_ts", names(cf), fixed = TRUE)])
+    a_pred <- d2 / (1 - d1)
+    a_po   <- (d2 + d4) / (1 - d1 - d3)
+  }
+  return(c(a_pred, a_po))
+}
+
+aLR_pb_4 <- get_aLR(Okun_pb_4, "partial")
+aLR_fb_4 <- get_aLR(Okun_fb_4, "full")
+aLR_pb_1 <- get_aLR(Okun_pb_1, "partial")
+aLR_fb_1 <- get_aLR(Okun_fb_1, "full")
+
+df_results <- data.frame(
+  Model = c("Čiastočný zlom (k=4)", "Úplný zlom (k=4)", 
+            "Čiastočný zlom (k=1)", "Úplný zlom (k=1)"),
+  a_pred = c(aLR_pb_4[1], aLR_fb_4[1], aLR_pb_1[1], aLR_fb_1[1]),
+  a_po   = c(aLR_pb_4[2], aLR_fb_4[2], aLR_pb_1[2], aLR_fb_1[2])
+)
+
+colnames(df_results) <- c("Špecifikácia modelu", "a_LR pred zlomom", "a_LR po zlome")
+knitr::kable(df_results, digits = 3, align = c("l", "c", "c"), caption = "Porovnanie dlhodobých Okunových koeficientov")
+```
+
+::: komentar
+**Diskusia k nevýznamným oneskoreniam:**
+Pri odhadoch s parametrom $k=4$ obsahuje model mnoho zbytočných koeficientov (hluk), čo môže vplyvom delenia spôsobiť destabilizáciu "predpovede" dlhodobého vzťahu. Tabuľka jasne reflektuje, že u preparametrizovaných modelov (najmä pre úplný zlom s $k=4$) môžu vzorce letieť do nepoužiteľných rozmerov kvôli kumulácii chýb. Redukciou na významné premenné (model $k=1$) sa dlhodobé vzťahy pred a po zlome stabilizujú na omnoho uveriteľnejších makroekonomických hodnotách okolo -0.11 pred krízou a -0.19 po kríze.
+:::
+
+## Príklad 3.4: Odchýlky a intervaly pre všetky modely
+
+Zadanie žiada analyzovať neistoty pre dlhodobé parametre kompletne vo všetkých modeloch (a to prostredníctvom Delta aj Simulačnej metódy). Keďže odhadujeme naraz 4 modely a 2 obdobia (8 cieľových hodnôt), vybudujeme na tento prepočet systematickú R funkciu spájajúcu maticové počty i 10 000 losovaní z Monte Carla. Týmto krokom získame nielen **Smerodajné odchýlky (SE)**, ale aj hraničné **Intervaly spoľahlivosti (CI)**.
+
+```{r se-intervals, warning=FALSE, message=FALSE}
+library(MASS)
+library(dplyr)
+library(ggplot2)
+
+set.seed(2026)
+
+calc_SE_aLR <- function(model_obj, model_type, name) {
+  cf <- coef(model_obj)
+  Sig <- vcov(model_obj)
+  
+  # Dynamické priradenie indexov naprieč k=1 až k=4
+  idx_d1 <- grep("L(uc_ts", names(cf), fixed = TRUE)
+  idx_d2 <- grep("L(yc_ts", names(cf), fixed = TRUE)
+  
+  d1 <- sum(cf[idx_d1]); d2 <- sum(cf[idx_d2])
+  
+  if(model_type == "partial") {
+    idx_d4 <- grep("D * yc_ts", names(cf), fixed = TRUE)
+    d4 <- sum(cf[idx_d4])
+    a_pred <- d2 / (1 - d1)
+    a_po   <- (d2 + d4) / (1 - d1)
+    
+    # Delta vektory (gradient)
+    G1 <- rep(0, length(cf)); G2 <- rep(0, length(cf))
+    G1[idx_d1] <- d2 / (1 - d1)^2; G1[idx_d2] <- 1 / (1 - d1)
+    G2[idx_d1] <- (d2 + d4) / (1 - d1)^2; G2[idx_d2] <- 1 / (1 - d1); G2[idx_d4] <- 1 / (1 - d1)
+    
+    # Simulačná lambda
+    get_mc <- function(row) {
+      r1 <- sum(row[idx_d1]); r2 <- sum(row[idx_d2]); r4 <- sum(row[idx_d4])
+      c(r2 / (1 - r1), (r2 + r4) / (1 - r1))
+    }
+  } else {
+    idx_d3 <- grep("D * uc_ts", names(cf), fixed = TRUE)
+    idx_d4 <- grep("D * yc_ts", names(cf), fixed = TRUE)
+    d3 <- sum(cf[idx_d3]); d4 <- sum(cf[idx_d4])
+    a_pred <- d2 / (1 - d1)
+    a_po   <- (d2 + d4) / (1 - d1 - d3)
+    
+    G1 <- rep(0, length(cf)); G2 <- rep(0, length(cf))
+    G1[idx_d1] <- d2 / (1 - d1)^2; G1[idx_d2] <- 1 / (1 - d1)
+    den <- 1 - d1 - d3; num <- d2 + d4
+    G2[idx_d1] <- num / den^2; G2[idx_d2] <- 1 / den
+    G2[idx_d3] <- num / den^2; G2[idx_d4] <- 1 / den
+    
+    get_mc <- function(row) {
+      r1 <- sum(row[idx_d1]); r2 <- sum(row[idx_d2])
+      r3 <- sum(row[idx_d3]); r4 <- sum(row[idx_d4])
+      c(r2 / (1 - r1), (r2 + r4) / (1 - r1 - r3))
+    }
+  }
+  
+  # Delta prepocet matic
+  G_mat <- rbind(G1, G2)
+  SE_delta <- sqrt(diag(G_mat %*% Sig %*% t(G_mat)))
+  
+  # K-R Simulacia 
+  MC <- 10000
+  draws <- mvrnorm(n = MC, mu = cf, Sigma = Sig)
+  a_draws <- apply(draws, 1, get_mc)
+  
+  df_draws <- data.frame(
+    Hodnota = c(a_draws[1,], a_draws[2,]),
+    Obdobie = factor(rep(c("Pred zlomom", "Po zlome"), each = MC), 
+                     levels = c("Pred zlomom", "Po zlome")),
+    Model = name
+  )
+  
+  ci_pred <- quantile(a_draws[1,], c(0.025, 0.975), na.rm=TRUE)
+  ci_po   <- quantile(a_draws[2,], c(0.025, 0.975), na.rm=TRUE)
+  
+  res <- data.frame(
+    Model = name, Obdobie = c("Pred", "Po"),
+    a_LR = c(a_pred, a_po),
+    SE_Delta = SE_delta, SE_KR = apply(a_draws, 1, sd, na.rm=TRUE),
+    CI_dolny = c(ci_pred[1], ci_po[1]), CI_horny = c(ci_pred[2], ci_po[2])
+  )
+  
+  list(table = res, draws = df_draws)
+}
+
+res1 <- calc_SE_aLR(Okun_pb_4, "partial", "Čiastočný zlom (k=4)")
+res2 <- calc_SE_aLR(Okun_fb_4, "full",    "Úplný zlom (k=4)")
+res3 <- calc_SE_aLR(Okun_pb_1, "partial", "Čiastočný zlom (k=1)")
+res4 <- calc_SE_aLR(Okun_fb_1, "full",    "Úplný zlom (k=1)")
+
+# Zlúčenie výsledkov do tabuľky
+df_all <- rbind(res1$table, res2$table, res3$table, res4$table)
+df_all_draws <- rbind(res1$draws, res2$draws, res3$draws, res4$draws)
+
+knitr::kable(df_all, digits = 3, row.names = FALSE, align="l",
+             caption = "SE a Intervaly spoľahlivosti dlhodobých koeficientov")
+```
+
+
+Ako vidíme v tabuľke, metódy (Delta a simulačná-KR) sa vo svojich plošných SE odhadoch prakticky zhodujú. Zároveň tu ale prichádza varovanie so zavedením zbytočných koeficientov s **k=4**. Tie v úplnom zlome expandovali natoľko obrovskú neistotu (rozpätie chyby presiahuje obrovské teoretické čísla), že ho môžeme pre praktickú analytiku formálne zavrhnúť. 
+
+### Vizuálne zhrnutie
+
+Aby sme videli, aké presné v skutočnosti sú, vykreslíme ich do hustotných grafov. Rozdelíme to na dva vizuály tak, aby nekompaktnosť orezu $k=4$ nekompromitovala mierku relevantných výsledkov z optimalizovaného výberu $k=1$.
+
+```{r plot-kr-all, fig.height=8, fig.width=8, message=FALSE, warning=FALSE}
+# Zobrazenie optimálnych modelov k=1
+g1 <- ggplot(subset(df_all_draws, grepl("k=1", Model)), 
+             aes(x = Hodnota, fill = Obdobie)) +
+  geom_density(alpha = 0.6) +
+  scale_fill_manual(values = c("salmon", "salmon4")) +
+  facet_wrap(~Model, ncol=1) +
+  theme_minimal() + 
+  xlim(-0.8, 0.4) + # Limit pre pekný vizuál zdravých modelov
+  labs(title = "Distribúcie KR odhadu pre modely (k=1)",
+       x = expression(a^{LR}), y = "Hustota pravdepodobnosti") +
+  theme(legend.position = "bottom")
+
+# Zobrazenie preparametrizovaných modelov k=4
+g2 <- ggplot(subset(df_all_draws, grepl("k=4", Model)), 
+             aes(x = Hodnota, fill = Obdobie)) +
+  geom_density(alpha = 0.6) +
+  scale_fill_manual(values = c("steelblue", "midnightblue")) +
+  facet_wrap(~Model, ncol=1) +
+  theme_minimal() + 
+  coord_cartesian(xlim = c(-5, 5)) + # Limit musel byť drasticky navýšený pre noise z chýb
+  labs(title = "Distribúcie KR odhadu pre preparametrizované modely (k=4)",
+       x = expression(a^{LR}), y = "Hustota pravdepodobnosti") +
+  theme(legend.position = "bottom")
+
+# Vykreslenie dvojsiete grafov
+gridExtra::grid.arrange(g1, g2, ncol=1)
+```
+
+::: komentar
+**Záverečné zhrnutie:** 
+Správna špecifikácia lagov je kritická. Krinsky-Robbove krivky pre modely $k=1$ (červené odtiene) stoja presne orezané na negatívnych, ekonomicky korektných prírastkoch. Naproti tomu variant pre $k=4$ (modré krivky) vykazuje extrémny chvost a nízku, plochú hustotu. Kvôli post-covidovému šumu v koeficientoch je rozdelenie zbytočne široké a rozptýlené.
+:::
+

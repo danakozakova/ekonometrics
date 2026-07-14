@@ -30,3 +30,8 @@ rmarkdown::render("okun_law.Rmd")
 ```
 
 alebo otvorením `.Rmd` v RStudiu → **Knit**.
+
+## HTML výstup
+
+(https://danakozakova.github.io/econometrics/02-okun-law/02-okun-law.html)
+
